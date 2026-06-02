@@ -1,7 +1,7 @@
 # window.py
 import threading
 import gi
-from gi.repository import Gtk, Adw, GLib, Pango, Gdk, GdkPixbuf
+from gi.repository import Gtk, Adw, GLib, Pango, Gdk
 
 import workers
 
@@ -41,23 +41,16 @@ class GiPlayerWindow(Adw.ApplicationWindow):
         self.download_queue = []  # List of dicts: {'pid': str, 'title': str}
         self.is_downloading = False
 
-        # --- File Chooser ---
-        self.file_chooser = Gtk.FileChooserNative(
-            title="Select Download Folder",
-            action=Gtk.FileChooserAction.SELECT_FOLDER,
-            transient_for=self,
-            modal=True
-        )
-        self.file_chooser.connect("response", self.on_file_chooser_response)
-
         # --- Layout Panes ---
         self.main_paned = Gtk.Paned(orientation=Gtk.Orientation.VERTICAL)
         self.main_paned.set_vexpand(True)
+        self.main_paned.set_position(460)
         self.main_vbox.append(self.main_paned)
 
         self.top_paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
         self.top_paned.set_resize_start_child(True)
         self.top_paned.set_wide_handle(True)
+        self.top_paned.set_position(440)
         self.main_paned.set_start_child(self.top_paned)
 
         # --- Left Side (Search) ---
@@ -110,11 +103,12 @@ class GiPlayerWindow(Adw.ApplicationWindow):
         self.download_hbox.set_hexpand(True)
         self.search_grid.attach(self.download_hbox, 1, 3, 2, 1)
 
-        self.download_dir_button = Gtk.Button(label="Select...")
-        self.download_dir_button.connect("clicked", lambda x: self.file_chooser.show())
+        self.download_dir_button = Gtk.Button(label="Select…")
+        self.download_dir_button.connect("clicked", self.on_select_folder_clicked)
         self.download_hbox.append(self.download_dir_button)
 
-        self.download_dir_display_label = Gtk.Label(label="<Default Location>")
+        self.download_dir_display_label = Gtk.Label(label="Default location")
+        self.download_dir_display_label.add_css_class("dim-label")
         self.download_dir_display_label.set_halign(Gtk.Align.START)
         self.download_dir_display_label.set_ellipsize(Pango.EllipsizeMode.START)
         self.download_hbox.append(self.download_dir_display_label)
@@ -162,43 +156,64 @@ class GiPlayerWindow(Adw.ApplicationWindow):
         self.queue_box.append(self.add_queue_button)
 
         # --- Right Side (Preview) ---
-        self.preview_scroll = Gtk.ScrolledWindow()
-        self.preview_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        self.preview_scroll.set_hexpand(True)
-        self.top_paned.set_end_child(self.preview_scroll)
-
-        self.preview_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
-        self.preview_vbox.set_margin_top(10)
-        self.preview_vbox.set_margin_bottom(10)
-        self.preview_vbox.set_margin_start(10)
-        self.preview_vbox.set_margin_end(10)
-        self.preview_scroll.set_child(self.preview_vbox)
+        # The preview pane is NOT itself scrolled: the image takes the bounded
+        # space above, and only the text block below scrolls when it overflows.
+        # This lets Gtk.Picture scale the thumbnail responsively to the pane.
+        self.preview_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        self.preview_box.set_margin_top(10)
+        self.preview_box.set_margin_bottom(10)
+        self.preview_box.set_margin_start(10)
+        self.preview_box.set_margin_end(10)
+        self.preview_box.set_hexpand(True)
+        self.top_paned.set_end_child(self.preview_box)
 
         self.preview_title = Gtk.Label()
         self.preview_title.set_markup("<b>Select a program to see details</b>")
         self.preview_title.set_halign(Gtk.Align.START)
         self.preview_title.set_wrap(True)
-        self.preview_vbox.append(self.preview_title)
+        self.preview_box.append(self.preview_title)
 
+        # Picture scales to fit its allocation (both dimensions bounded), so it
+        # keeps aspect ratio and re-scales automatically as the pane resizes.
+        # Picture does height-for-width itself, so it tracks the pane width and
+        # keeps aspect ratio without needing vexpand; the text area below takes
+        # the leftover vertical space instead.
         self.preview_image = Gtk.Picture()
         self.preview_image.set_visible(False)
-        self.preview_image.set_halign(Gtk.Align.CENTER)
-        self.preview_vbox.append(self.preview_image)
+        self.preview_image.set_can_shrink(True)
+        self.preview_image.set_content_fit(Gtk.ContentFit.CONTAIN)
+        self.preview_image.set_hexpand(True)
+        self.preview_box.append(self.preview_image)
+
+        # Description + details live in a scroller so long metadata never pushes
+        # the thumbnail off-screen.
+        self.preview_text_scroll = Gtk.ScrolledWindow()
+        self.preview_text_scroll.set_policy(
+            Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC
+        )
+        self.preview_text_scroll.set_min_content_height(140)
+        self.preview_text_scroll.set_vexpand(True)
+        self.preview_box.append(self.preview_text_scroll)
+
+        self.preview_text_box = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL, spacing=8
+        )
+        self.preview_text_scroll.set_child(self.preview_text_box)
 
         self.preview_desc = Gtk.Label()
         self.preview_desc.set_halign(Gtk.Align.START)
         self.preview_desc.set_wrap(True)
-        self.preview_vbox.append(self.preview_desc)
+        self.preview_text_box.append(self.preview_desc)
 
         self.preview_details_label = Gtk.Label()
         self.preview_details_label.set_halign(Gtk.Align.START)
         self.preview_details_label.set_selectable(True)
-        
+
         font_desc_details = Pango.FontDescription.from_string("monospace")
         attrs_details = Pango.AttrList()
         attrs_details.insert(Pango.attr_font_desc_new(font_desc_details))
         self.preview_details_label.set_attributes(attrs_details)
-        self.preview_vbox.append(self.preview_details_label)
+        self.preview_text_box.append(self.preview_details_label)
 
         # --- Bottom Panel (Log) ---
         self.log_scroll = Gtk.ScrolledWindow()
@@ -237,7 +252,7 @@ class GiPlayerWindow(Adw.ApplicationWindow):
         selected = self.results_list_box.get_selected_row() is not None
         self.add_queue_button.set_sensitive(sensitive and selected)
         
-        self.preview_scroll.set_sensitive(sensitive)
+        self.preview_box.set_sensitive(sensitive)
         return False
 
     def clear_search_results(self):
@@ -248,6 +263,7 @@ class GiPlayerWindow(Adw.ApplicationWindow):
         self.preview_title.set_markup("<b>Select a program to see details</b>")
         self.preview_desc.set_text("")
         self.preview_details_label.set_text("")
+        self.preview_image.set_paintable(None)
         self.preview_image.set_visible(False)
 
     def update_queue_display(self):
@@ -269,16 +285,25 @@ class GiPlayerWindow(Adw.ApplicationWindow):
 
     # --- Event Handlers ---
 
-    def on_file_chooser_response(self, dialog, response_id):
-        if response_id == Gtk.ResponseType.ACCEPT:
-            gfile = self.file_chooser.get_file()
-            path = gfile.get_path() if gfile is not None else None
-            if path is not None:
-                self.download_path = path
-                display_name = GLib.path_get_basename(path)
-                self.download_dir_display_label.set_text(display_name)
-                self.download_dir_display_label.set_tooltip_text(path)
-        dialog.hide()
+    def on_select_folder_clicked(self, button):
+        dialog = Gtk.FileDialog(title="Select Download Folder", modal=True)
+        dialog.select_folder(self, None, self._on_folder_selected)
+
+    def _on_folder_selected(self, dialog, result):
+        try:
+            gfile = dialog.select_folder_finish(result)
+        except GLib.Error:
+            # Dismissed or failed — keep the previous location.
+            return
+
+        path = gfile.get_path() if gfile is not None else None
+        if path is None:
+            return
+
+        self.download_path = path
+        self.download_dir_display_label.remove_css_class("dim-label")
+        self.download_dir_display_label.set_text(GLib.path_get_basename(path))
+        self.download_dir_display_label.set_tooltip_text(path)
 
     def on_search_button_clicked(self, widget):
         search_term = self.search_entry.get_text().strip()
@@ -344,7 +369,8 @@ class GiPlayerWindow(Adw.ApplicationWindow):
         pid = label.pid
 
         self.clear_preview_pane()
-        self.preview_title.set_markup(f"<b>Loading info for {pid}...</b>")
+        safe_pid = GLib.markup_escape_text(pid)
+        self.preview_title.set_markup(f"<b>Loading info for {safe_pid}…</b>")
         
         # Only disable search/filter controls, leave queue active
         self.search_entry.set_sensitive(False)
@@ -373,9 +399,9 @@ class GiPlayerWindow(Adw.ApplicationWindow):
         pid_v1 = info_data.pop("pid_v1", "Unknown PID")
         info_data.pop("pid", None)
 
-        title = f"<b>{name}</b>"
+        title = f"<b>{GLib.markup_escape_text(name)}</b>"
         if episode:
-            title += f"\n<i>{episode}</i>"
+            title += f"\n<i>{GLib.markup_escape_text(episode)}</i>"
 
         details = f"pid:       {pid_v1}\n"
         for key, value in info_data.items():
@@ -387,30 +413,15 @@ class GiPlayerWindow(Adw.ApplicationWindow):
         return False
 
     def _on_image_ready(self, pixbuf):
+        # Hand the full-resolution texture to the Picture and let GTK scale it
+        # to the pane (preserving aspect ratio, re-scaling on every resize).
         try:
-            container_width = self.preview_scroll.get_allocated_width()
-            container_width -= 20  
-            if container_width <= 0:
-                container_width = 250
-
-            img_width = pixbuf.get_width()
-            img_height = pixbuf.get_height()
-            scale = container_width / img_width
-            new_height = int(img_height * scale)
-
-            scaled_pixbuf = pixbuf.scale_simple(
-                container_width, 
-                new_height, 
-                GdkPixbuf.InterpType.BILINEAR
-            )
-            
-            texture = Gdk.Texture.new_for_pixbuf(scaled_pixbuf)
+            texture = Gdk.Texture.new_for_pixbuf(pixbuf)
             self.preview_image.set_paintable(texture)
             self.preview_image.set_visible(True)
-
         except Exception as e:
             self.add_to_log(f"Failed to display thumbnail: {e}\n")
-        
+
         return False
 
     # --- Queue Logic ---
