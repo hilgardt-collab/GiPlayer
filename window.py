@@ -5,6 +5,17 @@ from gi.repository import Gtk, Adw, GLib, Pango, Gdk, GdkPixbuf
 
 import workers
 
+
+class ResultLabel(Gtk.Label):
+    """A Gtk.Label that also carries the search-result metadata for a row."""
+
+    def __init__(self, pid, raw_line, title_text, **kwargs):
+        super().__init__(**kwargs)
+        self.pid = pid
+        self.raw_line = raw_line
+        self.title_text = title_text
+
+
 class GiPlayerWindow(Adw.ApplicationWindow):
     """
     The main application window for GiPlayer.
@@ -261,10 +272,12 @@ class GiPlayerWindow(Adw.ApplicationWindow):
     def on_file_chooser_response(self, dialog, response_id):
         if response_id == Gtk.ResponseType.ACCEPT:
             gfile = self.file_chooser.get_file()
-            self.download_path = gfile.get_path()
-            display_name = GLib.path_get_basename(self.download_path)
-            self.download_dir_display_label.set_text(display_name)
-            self.download_dir_display_label.set_tooltip_text(self.download_path)
+            path = gfile.get_path() if gfile is not None else None
+            if path is not None:
+                self.download_path = path
+                display_name = GLib.path_get_basename(path)
+                self.download_dir_display_label.set_text(display_name)
+                self.download_dir_display_label.set_tooltip_text(path)
         dialog.hide()
 
     def on_search_button_clicked(self, widget):
@@ -297,7 +310,13 @@ class GiPlayerWindow(Adw.ApplicationWindow):
         thread.start()
 
     def _on_search_result_added(self, line, pid, raw_line):
-        label = Gtk.Label(label=line)
+        # Hacky way to get the title: assume it's the text after the PID
+        # line format: <pid>: <name> -- <episode> ...
+        parts = line.split(':', 1)
+        title_text = parts[1].strip() if len(parts) > 1 else pid
+
+        label = ResultLabel(pid=pid, raw_line=raw_line, title_text=title_text,
+                            label=line)
         label.set_halign(Gtk.Align.START)
         label.set_hexpand(True)
         label.set_wrap(False)
@@ -307,13 +326,6 @@ class GiPlayerWindow(Adw.ApplicationWindow):
         attrs = Pango.AttrList()
         attrs.insert(Pango.attr_font_desc_new(font_desc))
         label.set_attributes(attrs)
-
-        label.pid = pid
-        label.raw_line = raw_line
-        # Hacky way to get the title: assume it's the text after the PID
-        # line format: <pid>: <name> -- <episode> ...
-        parts = line.split(':', 1)
-        label.title_text = parts[1].strip() if len(parts) > 1 else pid
 
         row = Gtk.ListBoxRow()
         row.set_child(label)
@@ -327,6 +339,8 @@ class GiPlayerWindow(Adw.ApplicationWindow):
 
         self.add_queue_button.set_sensitive(True)
         label = row.get_child()
+        if not isinstance(label, ResultLabel):
+            return
         pid = label.pid
 
         self.clear_preview_pane()
@@ -407,6 +421,8 @@ class GiPlayerWindow(Adw.ApplicationWindow):
             return
 
         label = selected_row.get_child()
+        if not isinstance(label, ResultLabel):
+            return
         pid = label.pid
         title = label.title_text
 

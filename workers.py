@@ -42,6 +42,7 @@ def search(term, channel, category, on_log, on_result, on_finished):
         )
 
         match_count = 0
+        assert process.stdout is not None  # guaranteed by stdout=PIPE
         for line in process.stdout:
             line = line.strip()
             if not line or "Matches:" in line or "INFO:" in line:
@@ -84,6 +85,7 @@ def fetch_info(pid, on_log, on_update_preview, on_image_ready, on_finished):
             errors='replace'
         )
 
+        assert process.stdout is not None  # guaranteed by stdout=PIPE
         for line in process.stdout:
             if "INFO:" in line:
                 continue
