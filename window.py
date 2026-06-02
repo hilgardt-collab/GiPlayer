@@ -32,9 +32,24 @@ class GiPlayerWindow(Adw.ApplicationWindow):
         self.title_widget = Adw.WindowTitle(title="GiPlayer")
         self.header.set_title_widget(self.title_widget)
 
+        # Busy spinner in the header — shown while a background search or
+        # info-fetch is running. A counter keeps it spinning until *all*
+        # in-flight operations finish.
+        self._busy_count = 0
+        self.spinner = Gtk.Spinner()
+        self.spinner.set_visible(False)
+        self.header.pack_start(self.spinner)
+
         self.main_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         self.main_vbox.append(self.header)
         self.set_content(self.main_vbox)
+
+        # Prerequisite warning banner (hidden unless a tool is missing).
+        self.prereq_banner = Adw.Banner()
+        self.prereq_banner.set_revealed(False)
+        self.main_vbox.append(self.prereq_banner)
+
+        self._prereqs_ok = True
 
         # --- State Management ---
         self.download_path = None
@@ -134,12 +149,27 @@ class GiPlayerWindow(Adw.ApplicationWindow):
         self.queue_expander = Gtk.Expander(label="Pending Items (0)")
         self.queue_list_box = Gtk.ListBox()
         self.queue_list_box.set_selection_mode(Gtk.SelectionMode.NONE)
-        
-        # Scroll for queue
+
+        # Placeholder so an *empty* queue still has real content to lay out
+        # when the expander is opened (an empty scroll area could otherwise
+        # leave the expander with nothing to size against).
+        queue_placeholder = Gtk.Label(label="No pending downloads")
+        queue_placeholder.add_css_class("dim-label")
+        queue_placeholder.set_margin_top(12)
+        queue_placeholder.set_margin_bottom(12)
+        self.queue_list_box.set_placeholder(queue_placeholder)
+
+        # Scroll for queue — size to its natural content (bounded), rather than
+        # forcing a fixed height the surrounding panes have to fight over.
         self.queue_scroll = Gtk.ScrolledWindow()
-        self.queue_scroll.set_min_content_height(100)
+        self.queue_scroll.set_policy(
+            Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC
+        )
+        self.queue_scroll.set_min_content_height(48)
+        self.queue_scroll.set_max_content_height(200)
+        self.queue_scroll.set_propagate_natural_height(True)
         self.queue_scroll.set_child(self.queue_list_box)
-        
+
         self.queue_expander.set_child(self.queue_scroll)
         self.queue_box.append(self.queue_expander)
 
@@ -156,10 +186,13 @@ class GiPlayerWindow(Adw.ApplicationWindow):
         self.queue_box.append(self.add_queue_button)
 
         # --- Right Side (Preview) ---
-        # The preview pane is NOT itself scrolled: the image takes the bounded
-        # space above, and only the text block below scrolls when it overflows.
-        # This lets Gtk.Picture scale the thumbnail responsively to the pane.
-        self.preview_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        # The preview is split vertically: the title sits at the top, then a
+        # Paned divides the image (top) from the scrolling text (bottom). Giving
+        # the image its own Paned child means it gets a *bounded* height (the
+        # divider position) instead of doing height-for-width off the full pane
+        # width — so Gtk.Picture scales the thumbnail to fit that sub-pane and
+        # never balloons off-screen. The divider is user-draggable.
+        self.preview_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
         self.preview_box.set_margin_top(10)
         self.preview_box.set_margin_bottom(10)
         self.preview_box.set_margin_start(10)
@@ -173,17 +206,30 @@ class GiPlayerWindow(Adw.ApplicationWindow):
         self.preview_title.set_wrap(True)
         self.preview_box.append(self.preview_title)
 
-        # Picture scales to fit its allocation (both dimensions bounded), so it
-        # keeps aspect ratio and re-scales automatically as the pane resizes.
-        # Picture does height-for-width itself, so it tracks the pane width and
-        # keeps aspect ratio without needing vexpand; the text area below takes
-        # the leftover vertical space instead.
+        # In-pane spinner shown while a program's details are being fetched.
+        self.preview_spinner = Gtk.Spinner()
+        self.preview_spinner.set_halign(Gtk.Align.CENTER)
+        self.preview_spinner.set_size_request(32, 32)
+        self.preview_spinner.set_visible(False)
+        self.preview_box.append(self.preview_spinner)
+
+        # Vertical split: image on top, text below.
+        self.preview_paned = Gtk.Paned(orientation=Gtk.Orientation.VERTICAL)
+        self.preview_paned.set_vexpand(True)
+        self.preview_paned.set_position(240)
+        self.preview_box.append(self.preview_paned)
+
+        # Thumbnail. Filling its Paned child (CONTAIN + can_shrink) makes the
+        # Picture scale the image to fit the bounded space, keeping aspect ratio
+        # and re-scaling as the divider/pane moves.
         self.preview_image = Gtk.Picture()
         self.preview_image.set_visible(False)
         self.preview_image.set_can_shrink(True)
         self.preview_image.set_content_fit(Gtk.ContentFit.CONTAIN)
         self.preview_image.set_hexpand(True)
-        self.preview_box.append(self.preview_image)
+        self.preview_paned.set_start_child(self.preview_image)
+        self.preview_paned.set_resize_start_child(True)
+        self.preview_paned.set_shrink_start_child(True)
 
         # Description + details live in a scroller so long metadata never pushes
         # the thumbnail off-screen.
@@ -191,9 +237,10 @@ class GiPlayerWindow(Adw.ApplicationWindow):
         self.preview_text_scroll.set_policy(
             Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC
         )
-        self.preview_text_scroll.set_min_content_height(140)
-        self.preview_text_scroll.set_vexpand(True)
-        self.preview_box.append(self.preview_text_scroll)
+        self.preview_text_scroll.set_min_content_height(100)
+        self.preview_paned.set_end_child(self.preview_text_scroll)
+        self.preview_paned.set_resize_end_child(True)
+        self.preview_paned.set_shrink_end_child(True)
 
         self.preview_text_box = Gtk.Box(
             orientation=Gtk.Orientation.VERTICAL, spacing=8
@@ -233,7 +280,78 @@ class GiPlayerWindow(Adw.ApplicationWindow):
             "end_mark", self.log_buffer.get_end_iter(), False
         )
 
+        # Verify external tools are present before the user tries to use them.
+        self._check_prerequisites()
+
     # --- UI Helpers ---
+
+    def _check_prerequisites(self):
+        """Probe for required/optional tools, report to the log, and surface a
+        banner (disabling search) if a critical dependency is missing."""
+        report = workers.check_prerequisites()
+        self.add_to_log("Checking prerequisites...\n")
+
+        blocking = []   # critical tools that are missing -> app unusable
+        warnings = []   # required-but-non-critical tools missing -> degraded
+        for item in report:
+            status = "OK     " if item["found"] else "MISSING"
+            tag = "required" if item["required"] else "optional"
+            location = f" -> {item['path']}" if item["found"] else ""
+            self.add_to_log(
+                f"  [{status}] {item['name']} ({tag}){location}\n"
+            )
+            if not item["found"]:
+                self.add_to_log(f"            {item['detail']}\n")
+                if item["critical"]:
+                    blocking.append(item["name"])
+                elif item["required"]:
+                    warnings.append(item["name"])
+
+        if blocking:
+            self._prereqs_ok = False
+            names = ", ".join(blocking)
+            self.prereq_banner.set_title(
+                f"Missing required tool: {names}. "
+                "Searching and downloading are disabled — see the log below."
+            )
+            self.prereq_banner.set_revealed(True)
+            # Disable the search controls; nothing will work without get_iplayer.
+            self.search_entry.set_sensitive(False)
+            self.search_button.set_sensitive(False)
+            self.channel_entry.set_sensitive(False)
+            self.category_entry.set_sensitive(False)
+        elif warnings:
+            names = ", ".join(warnings)
+            self.prereq_banner.set_title(
+                f"{names} not found. Searching and previews work, "
+                "but downloads will likely fail."
+            )
+            self.prereq_banner.set_revealed(True)
+            self.add_to_log(
+                "All critical prerequisites satisfied (with warnings above).\n"
+            )
+        else:
+            self.add_to_log("All prerequisites satisfied.\n")
+
+    def _set_busy(self, busy):
+        """Show/hide the header spinner using a counter so overlapping
+        background tasks don't stop it prematurely."""
+        if busy:
+            self._busy_count += 1
+            self.spinner.set_visible(True)
+            self.spinner.start()
+        else:
+            self._busy_count = max(0, self._busy_count - 1)
+            if self._busy_count == 0:
+                self.spinner.stop()
+                self.spinner.set_visible(False)
+        return False
+
+    def _on_worker_finished(self):
+        """Shared completion callback for search / info worker threads."""
+        self.set_controls_sensitive(True)
+        self._set_busy(False)
+        return False
 
     def add_to_log(self, text):
         self.log_buffer.insert(self.log_buffer.get_end_iter(), text)
@@ -241,10 +359,12 @@ class GiPlayerWindow(Adw.ApplicationWindow):
         return False
 
     def set_controls_sensitive(self, sensitive):
-        self.search_entry.set_sensitive(sensitive)
-        self.search_button.set_sensitive(sensitive)
-        self.channel_entry.set_sensitive(sensitive)
-        self.category_entry.set_sensitive(sensitive)
+        # Never re-enable search controls if a critical prerequisite is missing.
+        search_sensitive = sensitive and self._prereqs_ok
+        self.search_entry.set_sensitive(search_sensitive)
+        self.search_button.set_sensitive(search_sensitive)
+        self.channel_entry.set_sensitive(search_sensitive)
+        self.category_entry.set_sensitive(search_sensitive)
         self.results_list_box.set_sensitive(sensitive)
         self.download_dir_button.set_sensitive(sensitive)
         
@@ -265,6 +385,8 @@ class GiPlayerWindow(Adw.ApplicationWindow):
         self.preview_details_label.set_text("")
         self.preview_image.set_paintable(None)
         self.preview_image.set_visible(False)
+        self.preview_spinner.stop()
+        self.preview_spinner.set_visible(False)
 
     def update_queue_display(self):
         """Updates the listbox in the expander to match the download_queue list."""
@@ -318,17 +440,18 @@ class GiPlayerWindow(Adw.ApplicationWindow):
         self.clear_search_results()
         self.clear_preview_pane()
         self.set_controls_sensitive(False)
+        self._set_busy(True)
 
         # Start Worker
         thread = threading.Thread(
             target=workers.search,
             args=(
-                search_term, 
-                channel, 
+                search_term,
+                channel,
                 category,
-                self.add_to_log,             
-                self._on_search_result_added, 
-                lambda: self.set_controls_sensitive(True) 
+                self.add_to_log,
+                self._on_search_result_added,
+                self._on_worker_finished
             )
         )
         thread.daemon = True
@@ -371,10 +494,13 @@ class GiPlayerWindow(Adw.ApplicationWindow):
         self.clear_preview_pane()
         safe_pid = GLib.markup_escape_text(pid)
         self.preview_title.set_markup(f"<b>Loading info for {safe_pid}…</b>")
-        
+        self.preview_spinner.set_visible(True)
+        self.preview_spinner.start()
+
         # Only disable search/filter controls, leave queue active
         self.search_entry.set_sensitive(False)
         self.search_button.set_sensitive(False)
+        self._set_busy(True)
 
         thread = threading.Thread(
             target=workers.fetch_info,
@@ -383,13 +509,15 @@ class GiPlayerWindow(Adw.ApplicationWindow):
                 self.add_to_log,
                 self._on_update_preview,
                 self._on_image_ready,
-                lambda: self.set_controls_sensitive(True)
+                self._on_worker_finished
             )
         )
         thread.daemon = True
         thread.start()
 
     def _on_update_preview(self, info_data):
+        self.preview_spinner.stop()
+        self.preview_spinner.set_visible(False)
         name = info_data.pop("name", "Unknown Title")
         episode = info_data.pop("episode", "")
         desc = info_data.pop("desc", "No description available.")
@@ -413,8 +541,9 @@ class GiPlayerWindow(Adw.ApplicationWindow):
         return False
 
     def _on_image_ready(self, pixbuf):
-        # Hand the full-resolution texture to the Picture and let GTK scale it
-        # to the pane (preserving aspect ratio, re-scaling on every resize).
+        # The Picture lives in the preview Paned's top child, so it has a
+        # bounded allocation; CONTAIN + can_shrink scale the full-resolution
+        # pixbuf to fit that sub-pane (keeping aspect ratio) without overflowing.
         try:
             texture = Gdk.Texture.new_for_pixbuf(pixbuf)
             self.preview_image.set_paintable(texture)

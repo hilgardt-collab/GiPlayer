@@ -4,6 +4,7 @@ import threading
 import re
 import urllib.request
 import shlex
+import shutil
 import os
 import pty  # Required to force progress bar output
 from gi.repository import GLib, Gio, GdkPixbuf
@@ -13,13 +14,63 @@ PID_REGEX = re.compile(r"^\s*(\w+):")
 # Regex to capture percentage (e.g., "54.3%" or "54%")
 PROGRESS_REGEX = re.compile(r"(\d{1,3}(?:\.\d+)?)%")
 
+# External tools the app relies on. 'critical' tools block the whole app when
+# missing; non-critical 'required' tools only impair some features.
+PREREQUISITES = [
+    {
+        "name": "get_iplayer",
+        "required": True,
+        "critical": True,
+        "detail": "Core BBC download tool. Install it via your package manager "
+                  "(e.g. 'sudo apt install get-iplayer' or "
+                  "'sudo dnf install get_iplayer').",
+    },
+    {
+        "name": "ffmpeg",
+        "required": True,
+        "critical": False,
+        "detail": "Used by get_iplayer to convert/mux downloads. Searching and "
+                  "previews work without it, but downloads will fail.",
+    },
+    {
+        "name": "AtomicParsley",
+        "required": False,
+        "critical": False,
+        "detail": "Optional: used by get_iplayer to write MP4 metadata tags.",
+    },
+]
+
+
+def check_prerequisites():
+    """
+    Probe the system for required/optional external tools.
+
+    Returns a list of dicts, one per tool:
+        {'name', 'required', 'critical', 'found', 'path', 'detail'}
+    """
+    report = []
+    for spec in PREREQUISITES:
+        path = shutil.which(spec["name"])
+        report.append({
+            "name": spec["name"],
+            "required": spec["required"],
+            "critical": spec["critical"],
+            "found": path is not None,
+            "path": path or "",
+            "detail": spec["detail"],
+        })
+    return report
+
 def search(term, channel, category, on_log, on_result, on_finished):
     """
     Runs the get_iplayer search command.
     """
     try:
+        # Note: <categories> isn't populated in plain search mode (it only
+        # appears via --info), so we leave it out to avoid a literal
+        # "<categories>" showing up in the results list.
         cmd = ['get_iplayer', '--listformat',
-               '<pid>: <name> -- <episode> [<channel>, <categories>]']
+               '<pid>: <name> -- <episode> [<channel>]']
 
         if channel:
             cmd.extend(['--channel', channel])
@@ -117,7 +168,7 @@ def fetch_image(url, on_image_ready, on_log):
         headers = {'User-Agent': 'get_iplayer/3.30'}
         req = urllib.request.Request(url, headers=headers)
 
-        with urllib.request.urlopen(req) as response:
+        with urllib.request.urlopen(req, timeout=15) as response:
             image_data = response.read()
 
         glib_bytes = GLib.Bytes.new(image_data)
