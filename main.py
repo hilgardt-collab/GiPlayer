@@ -6,8 +6,8 @@ import gi
 gi.require_version('Gtk', '4.0')
 gi.require_version('Adw', '1')
 
-from gi.repository import Adw
-from window import GiPlayerWindow
+from gi.repository import Adw  # noqa: E402
+from window import GiPlayerWindow  # noqa: E402
 
 class GiPlayerApp(Adw.Application):
     """The main GTK Application class."""

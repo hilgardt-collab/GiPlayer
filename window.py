@@ -1,6 +1,7 @@
 # window.py
 import threading
-import gi
+from functools import partial
+
 from gi.repository import Gtk, Adw, GLib, Pango, Gdk
 
 import workers
@@ -55,6 +56,9 @@ class GiPlayerWindow(Adw.ApplicationWindow):
         self.download_path = None
         self.download_queue = []  # List of dicts: {'pid': str, 'title': str}
         self.is_downloading = False
+        # Incremented on every selection; callbacks from an older info fetch
+        # compare against it and drop their results if superseded.
+        self._info_request = 0
 
         # --- Layout Panes ---
         self.main_paned = Gtk.Paned(orientation=Gtk.Orientation.VERTICAL)
@@ -252,15 +256,14 @@ class GiPlayerWindow(Adw.ApplicationWindow):
         self.preview_desc.set_wrap(True)
         self.preview_text_box.append(self.preview_desc)
 
-        self.preview_details_label = Gtk.Label()
-        self.preview_details_label.set_halign(Gtk.Align.START)
-        self.preview_details_label.set_selectable(True)
-
-        font_desc_details = Pango.FontDescription.from_string("monospace")
-        attrs_details = Pango.AttrList()
-        attrs_details.insert(Pango.attr_font_desc_new(font_desc_details))
-        self.preview_details_label.set_attributes(attrs_details)
-        self.preview_text_box.append(self.preview_details_label)
+        # Metadata as a two-column key/value grid. Every value label wraps, so
+        # a long single-line field (get_iplayer prints desclong as one line)
+        # can't inflate the pane's minimum width. A non-wrapping label here
+        # made the preview box wider than the window, which pushed the
+        # thumbnail off-screen to the right.
+        self.preview_details_grid = Gtk.Grid(column_spacing=12, row_spacing=4)
+        self.preview_details_grid.set_hexpand(True)
+        self.preview_text_box.append(self.preview_details_grid)
 
         # --- Bottom Panel (Log) ---
         self.log_scroll = Gtk.ScrolledWindow()
@@ -367,11 +370,11 @@ class GiPlayerWindow(Adw.ApplicationWindow):
         self.category_entry.set_sensitive(search_sensitive)
         self.results_list_box.set_sensitive(sensitive)
         self.download_dir_button.set_sensitive(sensitive)
-        
+
         # Download button logic is now handled by queue status
         selected = self.results_list_box.get_selected_row() is not None
         self.add_queue_button.set_sensitive(sensitive and selected)
-        
+
         self.preview_box.set_sensitive(sensitive)
         return False
 
@@ -382,18 +385,39 @@ class GiPlayerWindow(Adw.ApplicationWindow):
     def clear_preview_pane(self):
         self.preview_title.set_markup("<b>Select a program to see details</b>")
         self.preview_desc.set_text("")
-        self.preview_details_label.set_text("")
+        self._set_preview_details([])
         self.preview_image.set_paintable(None)
         self.preview_image.set_visible(False)
         self.preview_spinner.stop()
         self.preview_spinner.set_visible(False)
+
+    def _set_preview_details(self, rows):
+        """Rebuild the details grid from an iterable of (key, value) pairs."""
+        grid = self.preview_details_grid
+        while child := grid.get_first_child():
+            grid.remove(child)
+
+        for i, (key, value) in enumerate(rows):
+            key_label = Gtk.Label(label=key)
+            key_label.add_css_class("dim-label")
+            key_label.set_halign(Gtk.Align.END)
+            key_label.set_valign(Gtk.Align.START)
+            grid.attach(key_label, 0, i, 1, 1)
+
+            value_label = Gtk.Label(label=value)
+            value_label.set_hexpand(True)
+            value_label.set_xalign(0.0)
+            value_label.set_wrap(True)
+            value_label.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
+            value_label.set_selectable(True)
+            grid.attach(value_label, 1, i, 1, 1)
 
     def update_queue_display(self):
         """Updates the listbox in the expander to match the download_queue list."""
         # Clear current list
         while child := self.queue_list_box.get_row_at_index(0):
             self.queue_list_box.remove(child)
-            
+
         for item in self.download_queue:
             label = Gtk.Label(label=f"{item['pid']} - {item['title']}")
             label.set_halign(Gtk.Align.START)
@@ -401,7 +425,7 @@ class GiPlayerWindow(Adw.ApplicationWindow):
             row = Gtk.ListBoxRow()
             row.set_child(label)
             self.queue_list_box.append(row)
-            
+
         count = len(self.download_queue)
         self.queue_expander.set_label(f"Pending Items ({count})")
 
@@ -502,45 +526,60 @@ class GiPlayerWindow(Adw.ApplicationWindow):
         self.search_button.set_sensitive(False)
         self._set_busy(True)
 
+        # The results list stays clickable during a fetch, so a second click
+        # can start a second thread. Tag this request so stale callbacks from
+        # an earlier fetch can't overwrite the newer selection's preview.
+        self._info_request += 1
+        request_id = self._info_request
+
         thread = threading.Thread(
             target=workers.fetch_info,
             args=(
                 pid,
                 self.add_to_log,
-                self._on_update_preview,
-                self._on_image_ready,
-                self._on_worker_finished
+                partial(self._on_update_preview, request_id),
+                partial(self._on_image_ready, request_id),
+                partial(self._on_info_finished, request_id)
             )
         )
         thread.daemon = True
         thread.start()
 
-    def _on_update_preview(self, info_data):
+    def _on_info_finished(self, request_id):
+        """Completion callback for an info fetch. A superseded request only
+        releases the busy counter; the newest one also re-enables controls."""
+        self._set_busy(False)
+        if request_id == self._info_request:
+            self.set_controls_sensitive(True)
+        return False
+
+    def _on_update_preview(self, request_id, info_data):
+        if request_id != self._info_request:
+            return False  # a newer selection superseded this fetch
+
         self.preview_spinner.stop()
         self.preview_spinner.set_visible(False)
         name = info_data.pop("name", "Unknown Title")
         episode = info_data.pop("episode", "")
         desc = info_data.pop("desc", "No description available.")
-        
+        pid = info_data.pop("pid", "Unknown PID")
+
         # Clean up
         info_data.pop("thumbnail", None)
-        pid_v1 = info_data.pop("pid_v1", "Unknown PID")
-        info_data.pop("pid", None)
 
         title = f"<b>{GLib.markup_escape_text(name)}</b>"
         if episode:
             title += f"\n<i>{GLib.markup_escape_text(episode)}</i>"
 
-        details = f"pid:       {pid_v1}\n"
-        for key, value in info_data.items():
-            details += f"{key.ljust(9)}: {value}\n"
-
         self.preview_title.set_markup(title)
         self.preview_desc.set_text(desc)
-        self.preview_details_label.set_text(details.strip())
+        self._set_preview_details([("pid", pid), *info_data.items()])
         return False
 
-    def _on_image_ready(self, pixbuf):
+    def _on_image_ready(self, request_id, pixbuf):
+        if request_id != self._info_request:
+            return False  # a newer selection superseded this fetch
+
         # The Picture lives in the preview Paned's top child, so it has a
         # bounded allocation; CONTAIN + can_shrink scale the full-resolution
         # pixbuf to fit that sub-pane (keeping aspect ratio) without overflowing.
@@ -588,10 +627,10 @@ class GiPlayerWindow(Adw.ApplicationWindow):
         # Pop the next item
         item = self.download_queue.pop(0)
         self.update_queue_display()
-        
+
         pid = item['pid']
         title = item['title']
-        
+
         self.is_downloading = True
         self.progress_bar.set_text(f"Downloading: {title}")
         self.progress_bar.set_fraction(0.0)
@@ -603,8 +642,8 @@ class GiPlayerWindow(Adw.ApplicationWindow):
         thread = threading.Thread(
             target=workers.download,
             args=(
-                pid, 
-                self.download_path, 
+                pid,
+                self.download_path,
                 self.add_to_log,
                 self._on_download_progress,
                 self._on_download_finished

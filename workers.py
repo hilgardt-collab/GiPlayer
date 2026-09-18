@@ -1,18 +1,22 @@
 # workers.py
 import subprocess
-import threading
 import re
 import urllib.request
 import shlex
 import shutil
 import os
 import pty  # Required to force progress bar output
-from gi.repository import GLib, Gio, GdkPixbuf
+import gi
+
+gi.require_version('GdkPixbuf', '2.0')
+from gi.repository import GLib, Gio, GdkPixbuf  # noqa: E402
 
 # Compile regex once at module level
 PID_REGEX = re.compile(r"^\s*(\w+):")
 # Regex to capture percentage (e.g., "54.3%" or "54%")
 PROGRESS_REGEX = re.compile(r"(\d{1,3}(?:\.\d+)?)%")
+# PTY output uses \r for in-place progress updates and \n for normal lines
+LINE_END_REGEX = re.compile(r"[\r\n]")
 
 # External tools the app relies on. 'critical' tools block the whole app when
 # missing; non-critical 'required' tools only impair some features.
@@ -96,7 +100,12 @@ def search(term, channel, category, on_log, on_result, on_finished):
         assert process.stdout is not None  # guaranteed by stdout=PIPE
         for line in process.stdout:
             line = line.strip()
-            if not line or "Matches:" in line or "INFO:" in line:
+            if not line or line.startswith(("Matches", "INFO:")):
+                continue
+            # get_iplayer logs warnings/errors to stdout too; they would
+            # otherwise match PID_REGEX and show up as result rows.
+            if line.startswith(("WARNING:", "ERROR:")):
+                GLib.idle_add(on_log, line + "\n")
                 continue
 
             match = PID_REGEX.match(line)
@@ -173,18 +182,35 @@ def fetch_image(url, on_image_ready, on_log):
 
         glib_bytes = GLib.Bytes.new(image_data)
         input_stream = Gio.MemoryInputStream.new_from_bytes(glib_bytes)
-        
+
         pixbuf = GdkPixbuf.Pixbuf.new_from_stream(input_stream, None)
-        
+
         GLib.idle_add(on_image_ready, pixbuf)
 
     except Exception as e:
         GLib.idle_add(on_log, f"Failed to download thumbnail: {e}\n")
 
+def _handle_output_line(line, on_log, on_progress):
+    """Route one line of get_iplayer output to the progress or log callback."""
+    line = line.strip()
+    if not line:
+        return
+
+    match_prog = PROGRESS_REGEX.search(line)
+    if match_prog:
+        percent = float(match_prog.group(1))
+        # Pass both percent AND the full text line (e.g. "54% of ~200MB ...")
+        GLib.idle_add(on_progress, percent, line)
+        return
+
+    # If not a progress line, log it
+    GLib.idle_add(on_log, line + "\n")
+
+
 def download(pid, download_path, on_log, on_progress, on_finished):
     """
     Downloads the program using a Pseudo-Terminal (PTY) to force progress output.
-    
+
     Args:
         on_progress (func): Callback(float, str) with percentage and status text.
     """
@@ -193,7 +219,7 @@ def download(pid, download_path, on_log, on_progress, on_finished):
         cmd = ['get_iplayer', '--get', f'--pid={pid}']
         if download_path:
             cmd.extend(['--output', download_path])
-        
+
         quoted_cmd = ' '.join(shlex.quote(arg) for arg in cmd)
         GLib.idle_add(on_log, f"Running command: {quoted_cmd}\n")
 
@@ -206,12 +232,12 @@ def download(pid, download_path, on_log, on_progress, on_finished):
             stderr=slave_fd, # Merge stderr into stdout
             close_fds=True,
             text=True, # Ignored when using fds, but good practice intent
-            bufsize=0 
+            bufsize=0
         )
-        
+
         # Close slave in parent process so we get EOF when child exits
         os.close(slave_fd)
-        slave_fd = None 
+        slave_fd = None
 
         buffer = ""
         while True:
@@ -224,39 +250,19 @@ def download(pid, download_path, on_log, on_progress, on_finished):
 
             if not data:
                 break
-            
-            # Decode bytes to string
-            chunk = data.decode('utf-8', errors='replace')
-            buffer += chunk
-            
-            # Process line by line (splitting on \r or \n)
-            while True:
-                # Find the earliest newline or carriage return
-                match = re.search(r'[\r\n]', buffer)
-                if not match:
-                    break
-                
-                line_end = match.start()
-                line = buffer[:line_end].strip()
-                buffer = buffer[match.end():] # Remove processed line from buffer
-                
-                if not line:
-                    continue
 
-                # Parse Progress
-                match_prog = PROGRESS_REGEX.search(line)
-                if match_prog:
-                    try:
-                        percent = float(match_prog.group(1))
-                        # Pass both percent AND the full text line (e.g. "54% (100MB/200MB)...")
-                        GLib.idle_add(on_progress, percent, line)
-                        # Don't log progress lines
-                        continue
-                    except ValueError:
-                        pass
-                
-                # If not a progress line, log it
-                GLib.idle_add(on_log, line + "\n")
+            # Decode bytes to string
+            buffer += data.decode('utf-8', errors='replace')
+
+            # Process every complete line (terminated by \r or \n); keep the
+            # unterminated remainder in the buffer for the next read.
+            *lines, buffer = LINE_END_REGEX.split(buffer)
+            for line in lines:
+                _handle_output_line(line, on_log, on_progress)
+
+        # Flush whatever was left without a trailing newline (typically a
+        # final error message) so it isn't silently dropped.
+        _handle_output_line(buffer, on_log, on_progress)
 
         process.wait()
         # --- End PTY Fix ---
