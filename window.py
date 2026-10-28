@@ -19,17 +19,42 @@ LEAVING_SOON_DAYS = 3
 # or unknown to the BBC.
 UNCATEGORISED_TITLE = "Uncategorised"
 
-# Adw.WrapBox (libadwaita 1.7) for the rows of filter tick boxes; None on
-# an older libadwaita, where a Gtk.FlowBox stands in.
+# Adw.WrapBox (libadwaita 1.7) lets the preview's chips wrap onto further
+# lines; on an older libadwaita a plain box stands in.
 WRAP_BOX_CLASS = getattr(Adw, "WrapBox", None)
+
+# Adw.Spinner (libadwaita 1.6) is the current indeterminate spinner; the
+# Gtk.Spinner fallback keeps older systems working.
+SPINNER_BASE = getattr(Adw, "Spinner", Gtk.Spinner)
 
 # Bold text for catalog rows that are new since the previous run.
 BOLD_ATTRS = Pango.AttrList()
 BOLD_ATTRS.insert(Pango.attr_weight_new(Pango.Weight.BOLD))
 
-# Pill badge in the "New" column. Its own background keeps it legible even
-# on a selected (accent-coloured) row.
+# Window width below which the filter sidebar folds away into an overlay.
+SIDEBAR_BREAKPOINT = "max-width: 1100sp"
+
+# Height of the log pane when it is opened; the divider above it can be
+# dragged to make it taller.
+LOG_PANE_HEIGHT = 220
+
+# Titles for the fields get_iplayer --info prints, where the field name
+# alone wouldn't do; any other field is shown with its first letter
+# capitalised.
+DETAIL_TITLES = {
+    "pid": "PID",
+    "desclong": "Long description",
+    "firstbcast": "First broadcast",
+    "nameshort": "Short name",
+    "longname": "Long name",
+    "seriesnum": "Series number",
+    "episodenum": "Episode number",
+    "web": "Web page",
+}
+
 APP_CSS = """
+/* Pill badge in the "New" column. Its own background keeps it legible
+   even on a selected (accent-coloured) row. */
 .new-badge {
   background-color: var(--accent-bg-color);
   color: var(--accent-fg-color);
@@ -46,32 +71,111 @@ columnview.numbered-sort > header > button sort-indicator {
   min-width: 0;
   min-height: 0;
 }
+
+/* Programme preview: rounded thumbnail, tag chips, details card. */
+.preview-thumbnail {
+  border-radius: 12px;
+}
+.chip {
+  background-color: alpha(currentColor, 0.1);
+  border-radius: 999px;
+  padding: 2px 10px;
+  font-size: 0.85em;
+  font-weight: 600;
+}
+.chip.accent {
+  background-color: var(--accent-bg-color);
+  color: var(--accent-fg-color);
+}
+.chip.success {
+  background-color: var(--success-bg-color);
+  color: var(--success-fg-color);
+}
+.preview-details {
+  padding: 10px 14px;
+}
+
+/* Pending-download count on the Queue button. */
+.queue-badge {
+  background-color: var(--accent-bg-color);
+  color: var(--accent-fg-color);
+  border-radius: 999px;
+  padding: 0 6px;
+  font-size: 0.8em;
+  font-weight: bold;
+}
+
+.log-view {
+  font-size: 0.9em;
+}
 """
 
 
-def _make_wrap_box():
-    """
-    A box that wraps its children onto further lines as the width
-    requires, with append() and remove_all().
+def _make_spinner():
+    """A busy spinner, hidden until _spin shows it."""
+    spinner = SPINNER_BASE()
+    spinner.set_visible(False)
+    return spinner
 
-    Adw.WrapBox packs each child at its own width. The Gtk.FlowBox
-    fallback lays children out in uniform columns as wide as the widest
-    child, so a long row takes more lines; and as its minimum height is
-    the height at min_children_per_line, that is kept above 1 so a long
-    row can't force the window taller than the screen.
-    """
+
+def _spin(spinner, spinning):
+    """Show the spinner while it spins and hide it otherwise. Adw.Spinner
+    animates whenever it is visible; the Gtk.Spinner fallback is started
+    and stopped as well."""
+    if SPINNER_BASE is Gtk.Spinner:
+        if spinning:
+            spinner.start()
+        else:
+            spinner.stop()
+    spinner.set_visible(spinning)
+
+
+def _make_wrap_box(spacing):
+    """A box that wraps its children onto further lines as the width
+    requires (a single line on a libadwaita without Adw.WrapBox)."""
     if WRAP_BOX_CLASS is not None:
         box = WRAP_BOX_CLASS()
-        box.set_child_spacing(6)
-        box.set_line_spacing(2)
+        box.set_child_spacing(spacing)
+        box.set_line_spacing(spacing)
         return box
-    box = Gtk.FlowBox()
-    box.set_selection_mode(Gtk.SelectionMode.NONE)
-    box.set_min_children_per_line(3)
-    box.set_max_children_per_line(64)
-    box.set_column_spacing(6)
-    box.set_row_spacing(2)
-    return box
+    return Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=spacing)
+
+
+def _remove_children(container):
+    """Remove every child of a container with remove(child)."""
+    while child := container.get_first_child():
+        container.remove(child)
+
+
+def _detail_title(key):
+    """Row title for a field name from get_iplayer --info."""
+    return DETAIL_TITLES.get(key) or (key[:1].upper() + key[1:])
+
+
+def _detail_value(key, value):
+    """A field value from get_iplayer --info in a readable form: dates in
+    local time, the expiry as a date, the duration in minutes. Anything
+    that doesn't parse is shown as printed."""
+    if key in ("available", "firstbcast"):
+        try:
+            return datetime.fromisoformat(value).astimezone().strftime(
+                "%Y-%m-%d %H:%M"
+            )
+        except (TypeError, ValueError):
+            return value
+    if key == "expires":
+        try:
+            return _format_datetime(int(value))
+        except (TypeError, ValueError):
+            return value
+    if key == "duration":
+        try:
+            seconds = int(value)
+        except (TypeError, ValueError):
+            return value
+        minutes, seconds = divmod(seconds, 60)
+        return f"{minutes} min {seconds} s" if seconds else f"{minutes} min"
+    return value
 
 
 def _format_date(timestamp):
@@ -240,15 +344,16 @@ class GiPlayerWindow(Adw.ApplicationWindow):
     """
     The main application window for GiPlayer.
 
-    The catalog of the ticked channels, filtered live by the search box,
-    sits beside the programme preview; the shared downloads area and the
-    log are below.
+    The filter sidebar sits beside the catalog of the ticked channels,
+    filtered live by the search box in the header, and the programme
+    preview; the downloads bar runs along the bottom, and the log can be
+    opened beneath the catalog.
     """
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
 
-        self.set_default_size(1280, 900)
+        self.set_default_size(1400, 900)
         self.set_title("GiPlayer")
 
         # --- State Management ---
@@ -320,44 +425,120 @@ class GiPlayerWindow(Adw.ApplicationWindow):
         self._preview_pid = None
 
         self._install_css()
+        self._build_actions()
 
-        # --- Header ---
+        # --- Header: sidebar toggle, busy spinner, search, rescan, log
+        # toggle and the primary menu ---
         self.header = Adw.HeaderBar()
-        self.header.set_show_end_title_buttons(True)
 
-        # Busy spinner in the header - shown while a background info-fetch
-        # or catalog scan is running. A counter keeps it spinning until
-        # *all* in-flight operations finish.
-        self.spinner = Gtk.Spinner()
-        self.spinner.set_visible(False)
+        self.sidebar_button = Gtk.ToggleButton(icon_name="sidebar-show-symbolic")
+        self.sidebar_button.set_tooltip_text("Show the filters (F9)")
+        self.header.pack_start(self.sidebar_button)
+
+        # Busy spinner - shown while a background info-fetch or catalog
+        # scan is running. A counter keeps it spinning until *all*
+        # in-flight operations finish.
+        self.spinner = _make_spinner()
         self.header.pack_start(self.spinner)
 
-        self.main_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-        self.main_vbox.append(self.header)
-        self.set_content(self.main_vbox)
+        # The search box filters the catalog as you type; nothing is sent
+        # to get_iplayer.
+        self.search_entry = Gtk.SearchEntry()
+        self.search_entry.set_placeholder_text("Search programmes")
+        self.search_entry.set_tooltip_text(
+            "Every word must appear in the programme's name, episode, "
+            "description, categories or pid (Ctrl+F)"
+        )
+        self.search_entry.set_hexpand(True)
+        self.search_entry.connect("search-changed", self._on_search_changed)
+        self.search_entry.connect("stop-search", self._on_stop_search)
+        search_clamp = Adw.Clamp(maximum_size=560, tightening_threshold=400)
+        search_clamp.set_hexpand(True)
+        search_clamp.set_child(self.search_entry)
+        self.header.set_title_widget(search_clamp)
 
-        # Prerequisite warning banner (hidden unless a tool is missing).
+        menu = Gio.Menu()
+        menu.append("Show Log", "win.show-log")
+        menu.append("About GiPlayer", "win.about")
+        menu_button = Gtk.MenuButton(icon_name="open-menu-symbolic")
+        menu_button.set_tooltip_text("Main menu")
+        menu_button.set_menu_model(menu)
+        menu_button.set_primary(True)
+        self.header.pack_end(menu_button)
+
+        self.log_button = Gtk.ToggleButton(icon_name="utilities-terminal-symbolic")
+        self.log_button.set_tooltip_text("Show the log (Ctrl+L)")
+        self.log_button.set_action_name("win.show-log")
+        self.header.pack_end(self.log_button)
+
+        self.rescan_button = Gtk.Button(icon_name="view-refresh-symbolic")
+        self.rescan_button.set_tooltip_text(
+            "Scan the ticked channels again and compare with the catalog "
+            "saved by the previous run (F5)"
+        )
+        self.rescan_button.connect("clicked", self._on_rescan_clicked)
+        self.header.pack_end(self.rescan_button)
+
+        # --- Layout: the header on top, the downloads bar along the
+        # bottom, and between them the filter sidebar beside the catalog,
+        # the preview and (when opened) the log ---
+        toolbar_view = Adw.ToolbarView()
+        toolbar_view.add_top_bar(self.header)
+        toolbar_view.add_bottom_bar(self._build_downloads_bar())
+        toolbar_view.set_bottom_bar_style(Adw.ToolbarStyle.RAISED)
+
+        self.toast_overlay = Adw.ToastOverlay()
+        self.toast_overlay.set_child(toolbar_view)
+        self.set_content(self.toast_overlay)
+
+        # Prerequisite warning banner (hidden unless a tool is missing);
+        # its button opens the log, where the details are.
         self.prereq_banner = Adw.Banner()
         self.prereq_banner.set_revealed(False)
-        self.main_vbox.append(self.prereq_banner)
+        self.prereq_banner.set_button_label("Show Log")
+        self.prereq_banner.connect(
+            "button-clicked", lambda _banner: self._set_log_shown(True)
+        )
 
-        # --- Layout: catalog + preview and downloads above the divider,
-        # log below ---
-        self.main_paned = Gtk.Paned(orientation=Gtk.Orientation.VERTICAL)
-        self.main_paned.set_vexpand(True)
-        # Room above the divider for the filter rows and a useful stretch
-        # of the list; the log below gets the rest.
-        self.main_paned.set_position(680)
-        self.main_vbox.append(self.main_paned)
+        # The log opens beneath the catalog and preview, at its own height
+        # until the divider is dragged.
+        self.log_paned = Gtk.Paned(orientation=Gtk.Orientation.VERTICAL)
+        self.log_paned.set_vexpand(True)
+        self.log_paned.set_resize_start_child(True)
+        self.log_paned.set_resize_end_child(False)
+        self.log_paned.set_shrink_end_child(False)
+        self.log_paned.set_start_child(self._build_browse_pane())
+        self.log_paned.set_end_child(self._build_log_pane())
 
-        upper = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-        self.main_paned.set_start_child(upper)
-        upper.append(self._build_browse_pane())
-        upper.append(self._build_downloads_frame())
-        self.main_paned.set_end_child(self._build_log_pane())
+        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        content.append(self.prereq_banner)
+        content.append(self.log_paned)
+
+        self.split_view = Adw.OverlaySplitView()
+        self.split_view.set_sidebar(self._build_filter_sidebar())
+        self.split_view.set_content(content)
+        self.split_view.set_min_sidebar_width(200)
+        self.split_view.set_max_sidebar_width(240)
+        self.split_view.set_sidebar_width_fraction(0.17)
+        self.split_view.set_show_sidebar(self.settings["show_sidebar"])
+        self.split_view.bind_property(
+            "show-sidebar", self.sidebar_button, "active",
+            GObject.BindingFlags.BIDIRECTIONAL | GObject.BindingFlags.SYNC_CREATE,
+        )
+        toolbar_view.set_content(self.split_view)
+
+        # On a narrow window the sidebar folds away, and overlays the
+        # catalog when opened; widening the window brings it back.
+        breakpoint = Adw.Breakpoint.new(
+            Adw.BreakpointCondition.parse(SIDEBAR_BREAKPOINT)
+        )
+        breakpoint.add_setter(self.split_view, "collapsed", True)
+        breakpoint.add_setter(self.split_view, "show-sidebar", False)
+        self.add_breakpoint(breakpoint)
 
         self.connect("close-request", self._on_close_request)
         self._build_catalog_menu()
+        self._set_log_shown(self.settings["show_log"])
 
         if settings_error:
             self.add_to_log(
@@ -367,6 +548,7 @@ class GiPlayerWindow(Adw.ApplicationWindow):
         # Verify external tools are present before the user tries to use them.
         self._check_prerequisites()
         self._restore_persisted_state()
+        self._update_match_count()
         self.search_entry.grab_focus()
 
         if self._prereqs_ok:
@@ -385,59 +567,105 @@ class GiPlayerWindow(Adw.ApplicationWindow):
                 display, provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
             )
 
+    def _build_actions(self):
+        """Window actions behind the header buttons, the menu and the
+        keyboard shortcuts."""
+        self.show_log_action = Gio.SimpleAction.new_stateful(
+            "show-log", None, GLib.Variant.new_boolean(False)
+        )
+        self.show_log_action.connect("change-state", self._on_show_log_state)
+        self.add_action(self.show_log_action)
+
+        for name, handler in (
+            ("focus-search", self._on_focus_search),
+            ("rescan", self._on_rescan_action),
+            ("show-sidebar", self._on_toggle_sidebar),
+            ("about", self._on_about),
+        ):
+            action = Gio.SimpleAction.new(name, None)
+            action.connect("activate", handler)
+            self.add_action(action)
+
+        app = self.get_application()
+        if app is not None:
+            app.set_accels_for_action("win.focus-search", ["<Control>f"])
+            app.set_accels_for_action("win.rescan", ["F5"])
+            app.set_accels_for_action("win.show-sidebar", ["F9"])
+            app.set_accels_for_action("win.show-log", ["<Control>l"])
+
+    def _on_show_log_state(self, action, value):
+        self._set_log_shown(value.get_boolean())
+
+    def _set_log_shown(self, shown):
+        self.show_log_action.set_state(GLib.Variant.new_boolean(shown))
+        self.log_scroll.set_visible(shown)
+        self.settings["show_log"] = shown
+
+    def _on_focus_search(self, action, parameter):
+        self.search_entry.grab_focus()
+
+    def _on_rescan_action(self, action, parameter):
+        if self.rescan_button.get_sensitive():
+            self._start_catalog_scan()
+
+    def _on_toggle_sidebar(self, action, parameter):
+        self.split_view.set_show_sidebar(not self.split_view.get_show_sidebar())
+
+    def _on_about(self, action, parameter):
+        about = Adw.AboutDialog()
+        about.set_application_name("GiPlayer")
+        about.set_application_icon("tv-symbolic")
+        about.set_comments(
+            "A graphical front-end for get_iplayer: browse, search and "
+            "download BBC programmes."
+        )
+        about.set_license("GiPlayer is released under the GNU General Public License.")
+        about.add_link("get_iplayer", "https://github.com/get-iplayer/get_iplayer")
+        about.present(self)
+
     def _build_browse_pane(self):
-        """Searchable catalog on the left, programme preview on the right."""
+        """Catalog on the left, programme preview on the right."""
         self.browse_paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
         self.browse_paned.set_vexpand(True)
         self.browse_paned.set_resize_start_child(True)
-        self.browse_paned.set_wide_handle(True)
         self.browse_paned.set_position(800)
         self.browse_paned.set_start_child(self._build_catalog_pane())
         self.browse_paned.set_end_child(self._build_preview_pane())
+        # The preview keeps a readable width; the catalog scrolls sideways
+        # instead when the window is narrow.
+        self.browse_paned.set_shrink_end_child(False)
         return self.browse_paned
 
-    def _build_catalog_pane(self):
-        """Search box, channel selection, scan status and the sortable
-        catalog with new programmes highlighted."""
-        pane = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-        pane.set_margin_top(6)
-        pane.set_margin_bottom(6)
-        pane.set_margin_start(6)
-        pane.set_margin_end(6)
-        pane.set_hexpand(True)
+    def _build_filter_sidebar(self):
+        """The filter sidebar: the new/leaving-soon filters, then one tick
+        box per channel (the channels ticked are also the ones scanned),
+        programme type and category."""
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18)
+        box.set_margin_top(12)
+        box.set_margin_bottom(12)
+        box.set_margin_start(12)
+        box.set_margin_end(12)
 
-        # The search box filters the catalog as you type; nothing is sent
-        # to get_iplayer.
-        self.search_entry = Gtk.SearchEntry()
-        self.search_entry.set_placeholder_text(
-            "Search the catalog (name, episode or description)…"
+        _section, show_box = self._add_filter_section(box, "Show")
+        self.only_new_check = Gtk.CheckButton(label="Only new programmes")
+        self.only_new_check.set_active(self.settings["show_only_new"])
+        self.only_new_check.set_tooltip_text(
+            "Show only programmes that weren't in the catalog last time"
         )
-        self.search_entry.connect("search-changed", self._on_search_changed)
-        self.search_entry.connect("stop-search", self._on_stop_search)
-        pane.append(self.search_entry)
+        self.only_new_check.connect("toggled", self._on_only_new_toggled)
+        show_box.append(self.only_new_check)
 
-        # Filter rows: channels (which are also the channels scanned) with
-        # the Rescan button, programme type, and category. The labels
-        # share a size group so the tick boxes of all three rows line up.
-        # (Rows of boxes rather than a grid: a grid measures its height at
-        # its minimum width, where a long row of tick boxes is one box per
-        # line, and that height would be forced on the window.)
-        filters = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
-        pane.append(filters)
-        label_group = Gtk.SizeGroup(mode=Gtk.SizeGroupMode.HORIZONTAL)
-
-        self.rescan_button = Gtk.Button(label="Rescan")
-        self.rescan_button.set_valign(Gtk.Align.START)
-        self.rescan_button.set_tooltip_text(
-            "Scan the ticked channels again and compare with the catalog "
-            "saved by the previous run"
+        self.leaving_soon_check = Gtk.CheckButton(label="Leaving soon")
+        self.leaving_soon_check.set_active(self.settings["show_leaving_soon"])
+        self.leaving_soon_check.set_tooltip_text(
+            "Show only programmes that expire within the next "
+            f"{LEAVING_SOON_DAYS} days"
         )
-        self.rescan_button.connect("clicked", self._on_rescan_clicked)
+        self.leaving_soon_check.connect("toggled", self._on_leaving_soon_toggled)
+        show_box.append(self.leaving_soon_check)
 
         self.channel_checks = {}
-        _row, channel_flow = self._add_filter_row(
-            filters, label_group, "Channels:", end_widget=self.rescan_button
-        )
+        _section, channel_box = self._add_filter_section(box, "Channels")
         for channel in catalog.SCAN_CHANNELS:
             check = self._make_filter_check(
                 channel, channel in self.settings["scan_channels"],
@@ -446,10 +674,10 @@ class GiPlayerWindow(Adw.ApplicationWindow):
                 self._on_scan_channel_toggled,
             )
             self.channel_checks[channel] = check
-            channel_flow.append(check)
+            channel_box.append(check)
 
         self.type_checks = {}
-        _row, type_flow = self._add_filter_row(filters, label_group, "Type:")
+        _section, type_box = self._add_filter_section(box, "Type")
         for kind in catalog.KINDS:
             check = self._make_filter_check(
                 kind, kind not in self._hidden_types,
@@ -458,97 +686,97 @@ class GiPlayerWindow(Adw.ApplicationWindow):
                 self._on_value_filter_toggled, "hidden_types",
             )
             self.type_checks[kind] = check
-            type_flow.append(check)
+            type_box.append(check)
 
         # One box per category in the catalog, built by
         # _update_category_checks once there is one; hidden until then.
         self.category_checks = {}
-        self.category_row, self.category_flow = self._add_filter_row(
-            filters, label_group, "Category:"
+        self.category_section, self.category_box = self._add_filter_section(
+            box, "Category"
         )
-        self.category_row.set_visible(False)
+        self.category_section.set_visible(False)
 
-        # Status line + the new-only and leaving-soon filters
-        status_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scroll.set_child(box)
+        return scroll
+
+    def _add_filter_section(self, container, title):
+        """A titled group of tick boxes appended to `container`:
+        (section, box the tick boxes go in)."""
+        section = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        container.append(section)
+        heading = Gtk.Label(label=title, xalign=0.0)
+        heading.add_css_class("heading")
+        section.append(heading)
+        checks = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        section.append(checks)
+        return section, checks
+
+    def _build_catalog_pane(self):
+        """Scan status, the sortable catalog with new programmes
+        highlighted (or a status page while nothing is listed), and the
+        match count beside the queue button."""
+        pane = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        pane.set_hexpand(True)
+
+        # Scan status on a single line; the full text is its tooltip.
+        status_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        status_row.set_margin_top(6)
+        status_row.set_margin_bottom(6)
+        status_row.set_margin_start(12)
+        status_row.set_margin_end(12)
         pane.append(status_row)
 
-        self.catalog_spinner = Gtk.Spinner()
-        self.catalog_spinner.set_visible(False)
+        self.catalog_spinner = _make_spinner()
         status_row.append(self.catalog_spinner)
 
         self.catalog_status_label = Gtk.Label(label="Not scanned yet.")
         self.catalog_status_label.add_css_class("dim-label")
+        self.catalog_status_label.add_css_class("caption")
         self.catalog_status_label.set_xalign(0.0)
-        self.catalog_status_label.set_wrap(True)
+        self.catalog_status_label.set_ellipsize(Pango.EllipsizeMode.END)
         self.catalog_status_label.set_hexpand(True)
         status_row.append(self.catalog_status_label)
 
-        self.only_new_check = Gtk.CheckButton(label="Only new programmes")
-        self.only_new_check.set_active(self.settings["show_only_new"])
-        self.only_new_check.set_valign(Gtk.Align.START)
-        self.only_new_check.set_tooltip_text(
-            "Show only programmes that weren't in the catalog last time"
-        )
-        self.only_new_check.connect("toggled", self._on_only_new_toggled)
-        status_row.append(self.only_new_check)
+        # The catalog itself, or a status page while there is nothing to
+        # list (see _update_match_count).
+        self.catalog_stack = Gtk.Stack()
+        self.catalog_stack.set_vexpand(True)
+        self.catalog_stack.set_transition_type(Gtk.StackTransitionType.CROSSFADE)
+        pane.append(self.catalog_stack)
 
-        self.leaving_soon_check = Gtk.CheckButton(label="Leaving soon")
-        self.leaving_soon_check.set_active(self.settings["show_leaving_soon"])
-        self.leaving_soon_check.set_valign(Gtk.Align.START)
-        self.leaving_soon_check.set_tooltip_text(
-            "Show only programmes that expire within the next "
-            f"{LEAVING_SOON_DAYS} days"
-        )
-        self.leaving_soon_check.connect("toggled", self._on_leaving_soon_toggled)
-        status_row.append(self.leaving_soon_check)
-
-        # The catalog itself
         scroll = Gtk.ScrolledWindow()
         scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
-        scroll.set_vexpand(True)
         scroll.set_child(self._build_catalog_view())
-        pane.append(scroll)
+        self.catalog_stack.add_named(scroll, "list")
+
+        self.catalog_empty_page = Adw.StatusPage()
+        self.catalog_empty_page.set_icon_name("system-search-symbolic")
+        self.catalog_empty_page.add_css_class("compact")
+        self.catalog_stack.add_named(self.catalog_empty_page, "empty")
 
         # Match count + queue button
-        bottom_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        pane.append(bottom_row)
+        actions = Gtk.ActionBar()
+        pane.append(actions)
 
         self.match_count_label = Gtk.Label()
         self.match_count_label.add_css_class("dim-label")
         self.match_count_label.set_xalign(0.0)
-        self.match_count_label.set_hexpand(True)
-        bottom_row.append(self.match_count_label)
+        self.match_count_label.set_ellipsize(Pango.EllipsizeMode.END)
+        actions.pack_start(self.match_count_label)
 
-        self.catalog_add_button = Gtk.Button(label="Add Selected to Queue")
+        self.catalog_add_button = Gtk.Button(label="Add to Queue")
+        self.catalog_add_button.add_css_class("suggested-action")
         self.catalog_add_button.set_sensitive(False)
         self.catalog_add_button.set_tooltip_text(
-            "Ctrl-click or Shift-click to select several programmes"
+            "Queue the selected programmes for download. Ctrl-click or "
+            "Shift-click to select several."
         )
         self.catalog_add_button.connect("clicked", self.on_catalog_add_clicked)
-        bottom_row.append(self.catalog_add_button)
+        actions.pack_end(self.catalog_add_button)
 
         return pane
-
-    def _add_filter_row(self, container, label_group, title, end_widget=None):
-        """A labelled row of tick boxes appended to `container`: (row, box).
-        The box wraps the tick boxes onto further lines instead of forcing
-        a minimum window width; `end_widget`, if given, follows them."""
-        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        container.append(row)
-
-        label = Gtk.Label(label=title, xalign=0.0)
-        label.set_valign(Gtk.Align.START)
-        label.set_margin_top(4)
-        label_group.add_widget(label)
-        row.append(label)
-
-        box = _make_wrap_box()
-        box.set_hexpand(True)
-        box.set_valign(Gtk.Align.START)
-        row.append(box)
-        if end_widget is not None:
-            row.append(end_widget)
-        return row, box
 
     def _make_filter_check(self, title, active, tooltip, handler, *args):
         check = Gtk.CheckButton(label=title)
@@ -567,7 +795,7 @@ class GiPlayerWindow(Adw.ApplicationWindow):
         if ordered == list(self.category_checks):
             return
 
-        self.category_flow.remove_all()
+        _remove_children(self.category_box)
         self.category_checks = {}
         for category in ordered:
             if category:
@@ -587,85 +815,108 @@ class GiPlayerWindow(Adw.ApplicationWindow):
                 self._on_value_filter_toggled, "hidden_categories",
             )
             self.category_checks[category] = check
-            self.category_flow.append(check)
-        self.category_row.set_visible(bool(ordered))
+            self.category_box.append(check)
+        self.category_section.set_visible(bool(ordered))
 
     def _build_preview_pane(self):
-        # The preview is split vertically: the title sits at the top, then a
-        # Paned divides the image (top) from the scrolling text (bottom). Giving
-        # the image its own Paned child means it gets a *bounded* height (the
-        # divider position) instead of doing height-for-width off the full pane
-        # width - so Gtk.Picture scales the thumbnail to fit that sub-pane and
-        # never balloons off-screen. The divider is user-draggable.
-        self.preview_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
-        self.preview_box.set_margin_top(10)
-        self.preview_box.set_margin_bottom(10)
-        self.preview_box.set_margin_start(10)
-        self.preview_box.set_margin_end(10)
-        self.preview_box.set_hexpand(True)
+        """Programme preview: thumbnail, title, chips, description and
+        details on one scrolling page, or a status page while nothing is
+        selected."""
+        self.preview_stack = Gtk.Stack()
+        self.preview_stack.set_hexpand(True)
+        self.preview_stack.set_size_request(300, -1)
 
-        self.preview_title = Gtk.Label()
-        self.preview_title.set_markup("<b>Select a programme to see details</b>")
-        self.preview_title.set_halign(Gtk.Align.START)
-        self.preview_title.set_wrap(True)
-        self.preview_box.append(self.preview_title)
+        empty = Adw.StatusPage()
+        empty.set_icon_name("tv-symbolic")
+        empty.set_title("No Programme Selected")
+        empty.set_description(
+            "Select a programme to see its details and thumbnail."
+        )
+        empty.add_css_class("compact")
+        self.preview_stack.add_named(empty, "empty")
 
-        # In-pane spinner shown while a programme's details are being fetched.
-        self.preview_spinner = Gtk.Spinner()
-        self.preview_spinner.set_halign(Gtk.Align.CENTER)
-        self.preview_spinner.set_size_request(32, 32)
-        self.preview_spinner.set_visible(False)
-        self.preview_box.append(self.preview_spinner)
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        self.preview_stack.add_named(scroll, "details")
 
-        # Vertical split: image on top, text below.
-        self.preview_paned = Gtk.Paned(orientation=Gtk.Orientation.VERTICAL)
-        self.preview_paned.set_vexpand(True)
-        self.preview_paned.set_position(240)
-        self.preview_box.append(self.preview_paned)
+        # The page scrolls at its natural height, so the thumbnail (whose
+        # minimum height is nothing, as it may shrink) gets the height
+        # its aspect ratio asks for rather than whatever is left over.
+        viewport = Gtk.Viewport()
+        viewport.set_vscroll_policy(Gtk.ScrollablePolicy.NATURAL)
+        scroll.set_child(viewport)
 
-        # Thumbnail. Filling its Paned child (CONTAIN + can_shrink) makes the
-        # Picture scale the image to fit the bounded space, keeping aspect ratio
-        # and re-scaling as the divider/pane moves.
+        # Every label on the page wraps, so a long single-line field
+        # (get_iplayer prints desclong as one line) can't inflate the
+        # pane's minimum width; the clamp keeps the text readable when
+        # the pane is dragged wide.
+        clamp = Adw.Clamp(maximum_size=720, tightening_threshold=560)
+        viewport.set_child(clamp)
+
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        page.set_margin_top(18)
+        page.set_margin_bottom(18)
+        page.set_margin_start(18)
+        page.set_margin_end(18)
+        clamp.set_child(page)
+
+        # Thumbnail: the picture's height follows the page width at the
+        # image's aspect ratio, and the widget clips to rounded corners.
         self.preview_image = Gtk.Picture()
         self.preview_image.set_visible(False)
         self.preview_image.set_can_shrink(True)
         self.preview_image.set_content_fit(Gtk.ContentFit.CONTAIN)
-        self.preview_image.set_hexpand(True)
-        self.preview_paned.set_start_child(self.preview_image)
-        self.preview_paned.set_resize_start_child(True)
-        self.preview_paned.set_shrink_start_child(True)
+        self.preview_image.set_overflow(Gtk.Overflow.HIDDEN)
+        self.preview_image.add_css_class("preview-thumbnail")
+        page.append(self.preview_image)
 
-        # Description + details live in a scroller so long metadata never pushes
-        # the thumbnail off-screen.
-        self.preview_text_scroll = Gtk.ScrolledWindow()
-        self.preview_text_scroll.set_policy(
-            Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC
-        )
-        self.preview_text_scroll.set_min_content_height(100)
-        self.preview_paned.set_end_child(self.preview_text_scroll)
-        self.preview_paned.set_resize_end_child(True)
-        self.preview_paned.set_shrink_end_child(True)
+        # Title and episode, with the spinner beside them while the full
+        # details are being fetched.
+        heading = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        page.append(heading)
 
-        self.preview_text_box = Gtk.Box(
-            orientation=Gtk.Orientation.VERTICAL, spacing=8
-        )
-        self.preview_text_scroll.set_child(self.preview_text_box)
+        titles = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        titles.set_hexpand(True)
+        heading.append(titles)
 
-        self.preview_desc = Gtk.Label()
-        self.preview_desc.set_halign(Gtk.Align.START)
+        self.preview_title = Gtk.Label(xalign=0.0)
+        self.preview_title.add_css_class("title-2")
+        self.preview_title.set_wrap(True)
+        self.preview_title.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
+        titles.append(self.preview_title)
+
+        self.preview_subtitle = Gtk.Label(xalign=0.0)
+        self.preview_subtitle.add_css_class("dim-label")
+        self.preview_subtitle.set_wrap(True)
+        self.preview_subtitle.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
+        titles.append(self.preview_subtitle)
+
+        self.preview_spinner = _make_spinner()
+        self.preview_spinner.set_valign(Gtk.Align.START)
+        heading.append(self.preview_spinner)
+
+        # Channel, type, category and download state as chips.
+        self.preview_chips = _make_wrap_box(6)
+        page.append(self.preview_chips)
+
+        self.preview_desc = Gtk.Label(xalign=0.0)
         self.preview_desc.set_wrap(True)
-        self.preview_text_box.append(self.preview_desc)
+        self.preview_desc.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
+        page.append(self.preview_desc)
 
-        # Metadata as a two-column key/value grid. Every value label wraps, so
-        # a long single-line field (get_iplayer prints desclong as one line)
-        # can't inflate the pane's minimum width. A non-wrapping label here
-        # made the preview box wider than the window, which pushed the
-        # thumbnail off-screen to the right.
-        self.preview_details_grid = Gtk.Grid(column_spacing=12, row_spacing=4)
-        self.preview_details_grid.set_hexpand(True)
-        self.preview_text_box.append(self.preview_details_grid)
+        # Metadata as key/value rows in a card. Rows of boxes rather than
+        # a grid: a grid measures its height at its minimum width, where
+        # a wrapping value is one character per line, and reports that
+        # height as its minimum.
+        self.preview_details_card = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL, spacing=6
+        )
+        self.preview_details_card.add_css_class("card")
+        self.preview_details_card.add_css_class("preview-details")
+        self.preview_details_card.set_visible(False)
+        page.append(self.preview_details_card)
 
-        return self.preview_box
+        return self.preview_stack
 
     def _build_catalog_view(self):
         """Sortable column view over the catalog."""
@@ -687,7 +938,6 @@ class GiPlayerWindow(Adw.ApplicationWindow):
         )
         self.catalog_view.set_model(self.catalog_selection)
         self.catalog_view.set_enable_rubberband(True)
-        self.catalog_view.add_css_class("data-table")
         self.catalog_view.add_css_class("numbered-sort")
         # Cells carry their own tooltips, so this one shows over the headers.
         self.catalog_view.set_tooltip_text(
@@ -732,20 +982,20 @@ class GiPlayerWindow(Adw.ApplicationWindow):
         self._default_orders = {}
         self._sorter_factories = {}
         new_column = self._add_catalog_column(
-            "New", "badge", by_number("new-rank"), asc, fixed_width=80
+            "New", "badge", by_number("new-rank"), asc, fixed_width=64
         )
         self._add_catalog_column(
             "Downloaded", "downloaded", by_number("downloaded-ts"), desc,
-            fixed_width=126
+            fixed_width=112
         )
         self._add_catalog_column(
-            "Channel", "channel", by_text("channel"), asc, fixed_width=120
+            "Channel", "channel", by_text("channel"), asc, fixed_width=108
         )
         self._add_catalog_column(
-            "Type", "kind", by_text("kind"), asc, fixed_width=90
+            "Type", "kind", by_text("kind"), asc, fixed_width=82
         )
         self._add_catalog_column(
-            "Category", "category", by_text("category"), asc, fixed_width=130
+            "Category", "category", by_text("category"), asc, fixed_width=124
         )
         self._add_catalog_column(
             "Name", "name", by_text("name"), asc, expand=True
@@ -755,7 +1005,7 @@ class GiPlayerWindow(Adw.ApplicationWindow):
         )
         available_column = self._add_catalog_column(
             "Available", "available", by_number("available-ts"), desc,
-            fixed_width=116
+            fixed_width=104
         )
 
         # New programmes first, most recently available next, by default.
@@ -793,6 +1043,7 @@ class GiPlayerWindow(Adw.ApplicationWindow):
             # The box fills the cell whether or not the tick shows, so the
             # cell keeps answering tooltip queries.
             tick = Gtk.Image.new_from_icon_name("object-select-symbolic")
+            tick.add_css_class("success")
             tick.set_hexpand(True)
             tick.set_halign(Gtk.Align.CENTER)
             child = Gtk.Box()
@@ -1006,80 +1257,110 @@ class GiPlayerWindow(Adw.ApplicationWindow):
     def _on_context_queue(self, action, parameter, force):
         self._queue_entries(self._context_entries, force)
 
-    def _build_downloads_frame(self):
-        """Download folder, pending queue and progress."""
-        frame = Gtk.Frame(label="Downloads")
-        self.queue_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-        self.queue_box.set_margin_top(6)
-        self.queue_box.set_margin_bottom(6)
-        self.queue_box.set_margin_start(6)
-        self.queue_box.set_margin_end(6)
-        frame.set_child(self.queue_box)
+    def _build_downloads_bar(self):
+        """Bottom bar: the download folder, the progress of the current
+        download, and the pending queue behind a button."""
+        bar = Gtk.ActionBar()
 
-        # Download Path UI
-        self.download_hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        self.queue_box.append(self.download_hbox)
-
-        self.download_dir_label = Gtk.Label(label="Download to:")
-        self.download_hbox.append(self.download_dir_label)
-
-        self.download_dir_button = Gtk.Button(label="Select…")
+        self.download_dir_content = Adw.ButtonContent()
+        self.download_dir_content.set_icon_name("folder-symbolic")
+        self.download_dir_content.set_label("Default location")
+        self.download_dir_button = Gtk.Button()
+        self.download_dir_button.set_child(self.download_dir_content)
+        self.download_dir_button.set_tooltip_text("Choose where downloads are saved")
         self.download_dir_button.connect("clicked", self.on_select_folder_clicked)
-        self.download_hbox.append(self.download_dir_button)
+        bar.pack_start(self.download_dir_button)
 
-        self.download_dir_display_label = Gtk.Label(label="Default location")
-        self.download_dir_display_label.add_css_class("dim-label")
-        self.download_dir_display_label.set_halign(Gtk.Align.START)
-        self.download_dir_display_label.set_hexpand(True)
-        self.download_dir_display_label.set_ellipsize(Pango.EllipsizeMode.START)
-        self.download_hbox.append(self.download_dir_display_label)
+        # Progress of the current download, kept to a readable width.
+        progress = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        progress.set_valign(Gtk.Align.CENTER)
+        progress.set_hexpand(True)
+        progress_clamp = Adw.Clamp(maximum_size=640, tightening_threshold=480)
+        progress_clamp.set_hexpand(True)
+        progress_clamp.set_margin_start(12)
+        progress_clamp.set_margin_end(12)
+        progress_clamp.set_child(progress)
+        bar.set_center_widget(progress_clamp)
 
-        # Queue List (Using an Expander to save space)
-        self.queue_expander = Gtk.Expander(label="Pending Items (0)")
+        self.progress_label = Gtk.Label(xalign=0.0)
+        self.progress_label.add_css_class("caption")
+        self.progress_label.add_css_class("dim-label")
+        self.progress_label.set_ellipsize(Pango.EllipsizeMode.MIDDLE)
+        progress.append(self.progress_label)
+
+        self.progress_bar = Gtk.ProgressBar()
+        progress.append(self.progress_bar)
+
+        # Queue button with the pending count; opens the list of pending
+        # downloads.
+        queue_content = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        queue_content.append(Gtk.Image.new_from_icon_name("folder-download-symbolic"))
+        queue_content.append(Gtk.Label(label="Queue"))
+        self.queue_badge = Gtk.Label()
+        self.queue_badge.add_css_class("queue-badge")
+        self.queue_badge.set_visible(False)
+        queue_content.append(self.queue_badge)
+
+        self.queue_button = Gtk.MenuButton()
+        self.queue_button.set_child(queue_content)
+        self.queue_button.set_popover(self._build_queue_popover())
+        bar.pack_end(self.queue_button)
+
+        self._set_progress("Idle", 0.0, active=False)
+        return bar
+
+    def _build_queue_popover(self):
+        popover = Gtk.Popover()
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        box.set_margin_top(6)
+        box.set_margin_bottom(6)
+        box.set_margin_start(6)
+        box.set_margin_end(6)
+        popover.set_child(box)
+
+        heading = Gtk.Label(label="Pending Downloads", xalign=0.0)
+        heading.add_css_class("heading")
+        heading.set_margin_start(6)
+        heading.set_margin_top(4)
+        box.append(heading)
+
         self.queue_list_box = Gtk.ListBox()
         self.queue_list_box.set_selection_mode(Gtk.SelectionMode.NONE)
+        self.queue_list_box.add_css_class("navigation-sidebar")
 
-        # Placeholder so an *empty* queue still has real content to lay out
-        # when the expander is opened (an empty scroll area could otherwise
-        # leave the expander with nothing to size against).
         queue_placeholder = Gtk.Label(label="No pending downloads")
         queue_placeholder.add_css_class("dim-label")
         queue_placeholder.set_margin_top(12)
         queue_placeholder.set_margin_bottom(12)
         self.queue_list_box.set_placeholder(queue_placeholder)
 
-        # Scroll for queue - size to its natural content (bounded), rather than
-        # forcing a fixed height the surrounding panes have to fight over.
+        # Sized to its content up to a limit, then scrolls.
         self.queue_scroll = Gtk.ScrolledWindow()
         self.queue_scroll.set_policy(
             Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC
         )
-        self.queue_scroll.set_min_content_height(48)
-        self.queue_scroll.set_max_content_height(200)
+        self.queue_scroll.set_size_request(380, -1)
+        self.queue_scroll.set_max_content_height(320)
         self.queue_scroll.set_propagate_natural_height(True)
         self.queue_scroll.set_child(self.queue_list_box)
-
-        self.queue_expander.set_child(self.queue_scroll)
-        self.queue_box.append(self.queue_expander)
-
-        # Progress Bar
-        self.progress_bar = Gtk.ProgressBar()
-        self.progress_bar.set_show_text(True)
-        self.progress_bar.set_text("Idle")
-        self.queue_box.append(self.progress_bar)
-
-        return frame
+        box.append(self.queue_scroll)
+        return popover
 
     def _build_log_pane(self):
         self.log_scroll = Gtk.ScrolledWindow()
         self.log_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
-        self.log_scroll.set_vexpand(True)
+        self.log_scroll.set_min_content_height(LOG_PANE_HEIGHT)
 
         self.log_text_view = Gtk.TextView()
         self.log_text_view.set_editable(False)
         self.log_text_view.set_cursor_visible(False)
         self.log_text_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
         self.log_text_view.set_monospace(True)
+        self.log_text_view.add_css_class("log-view")
+        self.log_text_view.set_left_margin(12)
+        self.log_text_view.set_right_margin(12)
+        self.log_text_view.set_top_margin(8)
+        self.log_text_view.set_bottom_margin(8)
         self.log_scroll.set_child(self.log_text_view)
 
         self.log_buffer = self.log_text_view.get_buffer()
@@ -1117,7 +1398,7 @@ class GiPlayerWindow(Adw.ApplicationWindow):
             names = ", ".join(blocking)
             self.prereq_banner.set_title(
                 f"Missing required tool: {names}. Scanning, programme details "
-                "and downloads are disabled — see the log below."
+                "and downloads are disabled — see the log."
             )
             self.prereq_banner.set_revealed(True)
             # Nothing but browsing the saved catalog works without get_iplayer.
@@ -1216,14 +1497,15 @@ class GiPlayerWindow(Adw.ApplicationWindow):
         background tasks don't stop it prematurely."""
         if busy:
             self._busy_count += 1
-            self.spinner.set_visible(True)
-            self.spinner.start()
+            _spin(self.spinner, True)
         else:
             self._busy_count = max(0, self._busy_count - 1)
             if self._busy_count == 0:
-                self.spinner.stop()
-                self.spinner.set_visible(False)
+                _spin(self.spinner, False)
         return False
+
+    def _toast(self, text):
+        self.toast_overlay.add_toast(Adw.Toast.new(text))
 
     def add_to_log(self, text):
         self.log_buffer.insert(self.log_buffer.get_end_iter(), text)
@@ -1231,26 +1513,61 @@ class GiPlayerWindow(Adw.ApplicationWindow):
         return False
 
     def clear_preview_pane(self):
-        self.preview_title.set_markup("<b>Select a programme to see details</b>")
+        self._reset_preview()
+        self.preview_stack.set_visible_child_name("empty")
+
+    def _reset_preview(self):
+        """Empty every part of the details page without switching to it."""
+        self._set_preview_heading("", "")
+        _remove_children(self.preview_chips)
         self.preview_desc.set_text("")
         self._set_preview_details([])
         self.preview_image.set_paintable(None)
         self.preview_image.set_visible(False)
-        self.preview_spinner.stop()
-        self.preview_spinner.set_visible(False)
+        _spin(self.preview_spinner, False)
+
+    def _set_preview_heading(self, name, episode):
+        self.preview_title.set_text(name)
+        self.preview_subtitle.set_text(episode)
+        self.preview_subtitle.set_visible(bool(episode))
+
+    def _set_preview_chips(self, entry):
+        """Chips under the title: new, channel, type, category, downloaded."""
+        _remove_children(self.preview_chips)
+        chips = [
+            ("New", "accent") if entry.is_new else None,
+            (entry.channel, None),
+            (entry.kind, None),
+            (entry.category, None),
+            ("Downloaded", "success") if entry.downloaded else None,
+        ]
+        for chip in chips:
+            if chip is None or not chip[0]:
+                continue
+            label = Gtk.Label(label=chip[0])
+            label.add_css_class("chip")
+            if chip[1]:
+                label.add_css_class(chip[1])
+            self.preview_chips.append(label)
 
     def _set_preview_details(self, rows):
-        """Rebuild the details grid from an iterable of (key, value) pairs."""
-        grid = self.preview_details_grid
-        while child := grid.get_first_child():
-            grid.remove(child)
+        """Rebuild the details card from an iterable of (key, value) pairs."""
+        card = self.preview_details_card
+        _remove_children(card)
 
-        for i, (key, value) in enumerate(rows):
-            key_label = Gtk.Label(label=key)
+        rows = list(rows)
+        card.set_visible(bool(rows))
+        # The keys share a width so the values line up.
+        key_group = Gtk.SizeGroup(mode=Gtk.SizeGroupMode.HORIZONTAL)
+        for key, value in rows:
+            key_label = Gtk.Label(label=_detail_title(key))
             key_label.add_css_class("dim-label")
-            key_label.set_halign(Gtk.Align.END)
+            key_label.set_xalign(1.0)
             key_label.set_valign(Gtk.Align.START)
-            grid.attach(key_label, 0, i, 1, 1)
+            key_label.set_justify(Gtk.Justification.RIGHT)
+            key_label.set_wrap(True)
+            key_label.set_max_width_chars(12)
+            key_group.add_widget(key_label)
 
             value_label = Gtk.Label(label=value)
             value_label.set_hexpand(True)
@@ -1258,33 +1575,60 @@ class GiPlayerWindow(Adw.ApplicationWindow):
             value_label.set_wrap(True)
             value_label.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
             value_label.set_selectable(True)
-            grid.attach(value_label, 1, i, 1, 1)
+
+            row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=16)
+            row.append(key_label)
+            row.append(value_label)
+            card.append(row)
 
     def update_queue_display(self):
-        """Updates the listbox in the expander to match the download_queue list."""
-        # Clear current list
+        """Rebuild the pending list in the queue popover, and the count on
+        its button, from download_queue."""
         while child := self.queue_list_box.get_row_at_index(0):
             self.queue_list_box.remove(child)
 
         for item in self.download_queue:
-            text = f"{item['pid']} - {item['title']}"
+            title = Gtk.Label(label=item["title"], xalign=0.0)
+            title.set_ellipsize(Pango.EllipsizeMode.END)
+            detail = item["pid"]
             if item.get("force"):
-                text += "  (re-download)"
-            label = Gtk.Label(label=text)
-            label.set_halign(Gtk.Align.START)
-            label.set_ellipsize(Pango.EllipsizeMode.END)
+                detail += "  ·  re-download"
+            subtitle = Gtk.Label(label=detail, xalign=0.0)
+            subtitle.add_css_class("caption")
+            subtitle.add_css_class("dim-label")
+            subtitle.set_ellipsize(Pango.EllipsizeMode.END)
+
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+            box.append(title)
+            box.append(subtitle)
             row = Gtk.ListBoxRow()
-            row.set_child(label)
+            row.set_activatable(False)
+            row.set_child(box)
             self.queue_list_box.append(row)
 
         count = len(self.download_queue)
-        self.queue_expander.set_label(f"Pending Items ({count})")
+        self.queue_badge.set_text(str(count))
+        self.queue_badge.set_visible(count > 0)
+        if count == 0:
+            self.queue_button.set_tooltip_text("No pending downloads")
+        else:
+            self.queue_button.set_tooltip_text(
+                f"{count} pending download{'s' if count != 1 else ''}"
+            )
+
+    def _set_progress(self, text, fraction=None, active=True):
+        """Status text (and, if given, fill) of the download progress. The
+        bar itself only shows while a download is active."""
+        self.progress_label.set_text(text)
+        self.progress_label.set_tooltip_text(text)
+        if fraction is not None:
+            self.progress_bar.set_fraction(fraction)
+        self.progress_bar.set_visible(active)
 
     def _apply_download_path(self, path):
         self.download_path = path
-        self.download_dir_display_label.remove_css_class("dim-label")
-        self.download_dir_display_label.set_text(GLib.path_get_basename(path))
-        self.download_dir_display_label.set_tooltip_text(path)
+        self.download_dir_content.set_label(GLib.path_get_basename(path))
+        self.download_dir_button.set_tooltip_text(f"Downloads are saved to {path}")
 
     # --- Event Handlers ---
 
@@ -1293,6 +1637,10 @@ class GiPlayerWindow(Adw.ApplicationWindow):
         # layout; detach it so the column view doesn't dispose with a
         # child left over.
         self.catalog_menu.unparent()
+        # The sidebar comes back as it was, unless it was folded away by
+        # the window being narrow.
+        if not self.split_view.get_collapsed():
+            self.settings["show_sidebar"] = self.split_view.get_show_sidebar()
         # Pending and in-progress downloads come back next time.
         self._save_settings()
         # Categories looked up so far are worth keeping if the lookup is
@@ -1366,17 +1714,29 @@ class GiPlayerWindow(Adw.ApplicationWindow):
         self._update_catalog_add_button()
 
     def _update_match_count(self):
+        """The match count under the list, and the status page that
+        stands in for the list while it is empty."""
         shown = self.catalog_filtered.get_n_items()
         total = self.catalog_store.get_n_items()
         if total == 0:
             text = ""
+            self.catalog_empty_page.set_title("No Catalog Yet")
+            self.catalog_empty_page.set_description(
+                "Programmes appear here once the ticked channels have "
+                "been scanned."
+            )
         elif shown == total:
             text = f"{total:,} programmes"
         elif shown == 0:
             text = f"No matches among {total:,} programmes"
+            self.catalog_empty_page.set_title("No Matching Programmes")
+            self.catalog_empty_page.set_description(
+                "Try another search, or tick more boxes in the filters."
+            )
         else:
             text = f"{shown:,} of {total:,} programmes"
         self.match_count_label.set_text(text)
+        self.catalog_stack.set_visible_child_name("list" if shown else "empty")
 
     # --- Preview ---
 
@@ -1408,12 +1768,10 @@ class GiPlayerWindow(Adw.ApplicationWindow):
         """Show what the catalog knows at once, then fetch the full details
         and thumbnail from get_iplayer in the background."""
         self._preview_pid = entry.pid
-        self.clear_preview_pane()
+        self._reset_preview()
 
-        title = f"<b>{GLib.markup_escape_text(entry.name)}</b>"
-        if entry.episode:
-            title += f"\n<i>{GLib.markup_escape_text(entry.episode)}</i>"
-        self.preview_title.set_markup(title)
+        self._set_preview_heading(entry.name, entry.episode)
+        self._set_preview_chips(entry)
         self.preview_desc.set_text(entry.desc)
         details = [("pid", entry.pid), ("channel", entry.channel)]
         if entry.categories:
@@ -1423,12 +1781,12 @@ class GiPlayerWindow(Adw.ApplicationWindow):
             details.append(("expires", entry.expires))
         details.extend(self._downloaded_details(entry))
         self._set_preview_details(details)
+        self.preview_stack.set_visible_child_name("details")
 
         if not self._prereqs_ok:
             return  # get_iplayer is missing; the catalog data is all there is
 
-        self.preview_spinner.set_visible(True)
-        self.preview_spinner.start()
+        _spin(self.preview_spinner, True)
         self._set_busy(True)
 
         # A second click can start a second fetch before the first returns.
@@ -1455,16 +1813,14 @@ class GiPlayerWindow(Adw.ApplicationWindow):
         busy counter; only the newest one also stops the preview spinner."""
         self._set_busy(False)
         if request_id == self._info_request:
-            self.preview_spinner.stop()
-            self.preview_spinner.set_visible(False)
+            _spin(self.preview_spinner, False)
         return False
 
     def _on_update_preview(self, request_id, info_data):
         if request_id != self._info_request:
             return False  # a newer selection superseded this fetch
 
-        self.preview_spinner.stop()
-        self.preview_spinner.set_visible(False)
+        _spin(self.preview_spinner, False)
         name = info_data.pop("name", "Unknown Title")
         episode = info_data.pop("episode", "")
         desc = info_data.pop("desc", "No description available.")
@@ -1473,15 +1829,15 @@ class GiPlayerWindow(Adw.ApplicationWindow):
         # Clean up
         info_data.pop("thumbnail", None)
 
-        title = f"<b>{GLib.markup_escape_text(name)}</b>"
-        if episode:
-            title += f"\n<i>{GLib.markup_escape_text(episode)}</i>"
-
-        self.preview_title.set_markup(title)
+        self._set_preview_heading(name, episode)
         self.preview_desc.set_text(desc)
-        details = [("pid", pid), *info_data.items()]
+        details = [("pid", pid)]
+        details.extend(
+            (key, _detail_value(key, value)) for key, value in info_data.items()
+        )
         entry = self._entries_by_pid.get(self._preview_pid)
         if entry is not None:
+            self._set_preview_chips(entry)
             details.extend(self._downloaded_details(entry))
         self._set_preview_details(details)
         return False
@@ -1517,6 +1873,7 @@ class GiPlayerWindow(Adw.ApplicationWindow):
 
     def _set_catalog_status(self, text):
         self.catalog_status_label.set_text(text)
+        self.catalog_status_label.set_tooltip_text(text)
 
     def _on_scan_channel_toggled(self, check):
         if self._syncing_checks:
@@ -1618,8 +1975,7 @@ class GiPlayerWindow(Adw.ApplicationWindow):
         self._scan_results = {}
 
         self.rescan_button.set_sensitive(False)
-        self.catalog_spinner.set_visible(True)
-        self.catalog_spinner.start()
+        _spin(self.catalog_spinner, True)
         self._set_catalog_status(
             f"Scanning {len(channels)} channel(s)… The first scan in a few "
             "hours also refreshes get_iplayer's cache, which can take a while."
@@ -1758,8 +2114,7 @@ class GiPlayerWindow(Adw.ApplicationWindow):
 
     def _finish_scan(self):
         self._scanning = False
-        self.catalog_spinner.stop()
-        self.catalog_spinner.set_visible(False)
+        _spin(self.catalog_spinner, False)
         if self._last_outcome is not None:
             self._set_catalog_status(self._describe_scan(self._last_outcome))
         self._set_busy(False)
@@ -1849,6 +2204,10 @@ class GiPlayerWindow(Adw.ApplicationWindow):
         # The sort model doesn't notice property changes by itself.
         if changed and self._is_sort_key("Downloaded"):
             self._apply_sort_keys()
+        # The preview's chips follow the programme it shows.
+        entry = self._entries_by_pid.get(self._preview_pid)
+        if changed and entry is not None:
+            self._set_preview_chips(entry)
 
     # --- Queue Logic ---
 
@@ -1877,10 +2236,13 @@ class GiPlayerWindow(Adw.ApplicationWindow):
         has it in its history or the file still exists; a plain queue entry
         for the same programme is upgraded to a re-download.
         """
+        if not entries:
+            return
         queued = {item["pid"]: item for item in self.download_queue}
         current = self.current_download
 
-        changed = False
+        added = 0
+        upgraded = 0
         for entry in entries:
             if current and entry.pid == current["pid"]:
                 self.add_to_log(f"{entry.pid} is downloading right now.\n")
@@ -1889,7 +2251,7 @@ class GiPlayerWindow(Adw.ApplicationWindow):
             if item is not None:
                 if force and not item.get("force"):
                     item["force"] = True
-                    changed = True
+                    upgraded += 1
                     self.add_to_log(
                         f"{entry.pid} is already queued; it will be "
                         "downloaded again.\n"
@@ -1900,14 +2262,36 @@ class GiPlayerWindow(Adw.ApplicationWindow):
             item = {"pid": entry.pid, "title": entry.title_text, "force": force}
             queued[entry.pid] = item
             self.download_queue.append(item)
-            changed = True
+            added += 1
             what = "for re-download" if force else "to queue"
             self.add_to_log(f"Added {entry.pid} {what}.\n")
 
-        if changed:
+        if added or upgraded:
             self.update_queue_display()
             self._save_settings()
             self._process_queue()
+        self._toast(self._describe_queued(entries, added, upgraded, force))
+
+    @staticmethod
+    def _describe_queued(entries, added, upgraded, force):
+        """Toast text summarising a queue request."""
+        def plural(count):
+            return f"{count} programme{'s' if count != 1 else ''}"
+
+        if added and force:
+            text = f"Queued {plural(added)} for re-download"
+        elif added:
+            text = f"Added {plural(added)} to the queue"
+        elif upgraded:
+            text = f"Marked {plural(upgraded)} for re-download"
+        elif len(entries) == 1:
+            return "Already queued or downloading"
+        else:
+            return "All of those are already queued or downloading"
+        skipped = len(entries) - added
+        if skipped and added:
+            text += f"; {skipped} already queued"
+        return text
 
     def _process_queue(self):
         """
@@ -1917,8 +2301,7 @@ class GiPlayerWindow(Adw.ApplicationWindow):
             return
 
         if not self.download_queue:
-            self.progress_bar.set_text("Queue Finished")
-            self.progress_bar.set_fraction(0.0)
+            self._set_progress("All downloads finished", 0.0, active=False)
             return
 
         if not self._prereqs_ok:
@@ -1940,8 +2323,7 @@ class GiPlayerWindow(Adw.ApplicationWindow):
         force = bool(item.get("force"))
 
         self.is_downloading = True
-        self.progress_bar.set_text(f"Downloading: {title}")
-        self.progress_bar.set_fraction(0.0)
+        self._set_progress(f"Downloading {title}", 0.0)
 
         if force:
             self.add_to_log(
@@ -1969,20 +2351,29 @@ class GiPlayerWindow(Adw.ApplicationWindow):
 
     def _on_download_progress(self, percent, text):
         """Updates progress bar fraction and text."""
-        fraction = percent / 100.0
-        self.progress_bar.set_fraction(fraction)
         # Use the full text status from get_iplayer (e.g., "54% - 12.3MB/s")
-        self.progress_bar.set_text(text)
+        self._set_progress(text, percent / 100.0)
         return False
 
     def _on_download_finished(self):
         """Called when a single download finishes."""
+        item = self.current_download
         self.is_downloading = False
         self.current_download = None
         self._save_settings()
         # get_iplayer has added the programme to its history by now (if the
         # download succeeded), so the row can show its tick.
+        before = self.download_history.get(item["pid"]) if item else None
         self._refresh_download_history()
+        if item is not None:
+            after = self.download_history.get(item["pid"])
+            if after is not None and after != before:
+                self._toast(f"Downloaded {item['title']}")
+            else:
+                self._toast(
+                    f"get_iplayer finished without downloading "
+                    f"{item['title']}; see the log"
+                )
         # Process next item
         self._process_queue()
         return False

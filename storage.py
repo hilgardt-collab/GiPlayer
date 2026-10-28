@@ -42,6 +42,9 @@ def default_settings():
         # '' in hidden_categories stands for programmes without one.
         "hidden_types": [],
         "hidden_categories": [],
+        # Whether the filter sidebar and the log pane are shown.
+        "show_sidebar": True,
+        "show_log": False,
         # [{'pid': str, 'title': str, 'force': bool}, ...] - downloads
         # pending or in progress when the app last closed, restored to the
         # queue on the next run. 'force' marks a deliberate re-download.
@@ -96,6 +99,8 @@ def load_settings():
 
     settings["show_only_new"] = bool(data.get("show_only_new", False))
     settings["show_leaving_soon"] = bool(data.get("show_leaving_soon", False))
+    settings["show_sidebar"] = bool(data.get("show_sidebar", True))
+    settings["show_log"] = bool(data.get("show_log", False))
 
     for key in ("hidden_types", "hidden_categories"):
         values = data.get(key)
